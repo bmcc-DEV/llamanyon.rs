@@ -1,0 +1,87 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_scalar_block_layout : require
+
+// GEMV Q4_K kernel for Vulkan Compute
+// Each workgroup computes one output row
+// Weight matrix stored in Q4_K format: super-blocks of 32 weights
+// Block: d(f16) + dmin(f16) + 16 nibbles = 20 bytes
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Push constants: kernel parameters
+layout(push_constant) uniform PushConstants {
+    int n_rows;        // number of output rows
+    int n_blocks;      // number of 256-element blocks in input
+    int input_dim;     // actual input dimension
+} pc;
+
+// Storage buffers
+layout(set = 0, binding = 0, scalar) buffer WeightBuf {
+    uint8_t weights[];
+} w_buf;
+
+layout(set = 0, binding = 1) buffer InputBuf {
+    float x[];
+} in_buf;
+
+layout(set = 0, binding = 2) buffer OutputBuf {
+    float y[];
+} out_buf;
+
+// Shared memory for input vector (tiled)
+shared float x_shared[256];
+
+// Q4_K block constants
+const int BLOCK_D = 32;
+const int BLOCK_BYTES = 20;
+
+// Dequantize one 4-bit block and dot with input tile
+float dequant_dot(uint block_offset, int dim) {
+    // Read block header: d and dmin as float16 (stored as 2 half-floats)
+    uint header = uint(w_buf.weights[block_offset]) |
+                  (uint(w_buf.weights[block_offset + 1]) << 8) |
+                  (uint(w_buf.weights[block_offset + 2]) << 16) |
+                  (uint(w_buf.weights[block_offset + 3]) << 24);
+    float d = uint16BitsToFloat(header & 0xFFFF);
+    float dmin = uint16BitsToFloat((header >> 16) & 0xFFFF);
+
+    float result = 0.0;
+    for (int i = 0; i < dim; i++) {
+        int nib_offset = (i / 2);
+        uint byte_idx = block_offset + 4 + nib_offset;
+        uint8_t nib_pair = w_buf.weights[byte_idx];
+        int shift = (i % 2) * 4;
+        int nib = int(nib_pair >> shift) & 0xF;
+        float k_val = d * float(nib) + dmin;
+        result += k_val * x_shared[i];
+    }
+    return result;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uint(pc.n_rows)) return;
+
+    // Cooperative load of input vector into shared memory
+    uint lid = gl_LocalInvocationID.x;
+    uint tiles = (pc.input_dim + 255) / 256;
+    for (uint t = 0; t < tiles; t++) {
+        uint idx = t * 256 + lid;
+        x_shared[lid] = (idx < uint(pc.input_dim)) ? in_buf.x[idx] : 0.0;
+        barrier();
+    }
+
+    barrier();
+
+    // Compute dot product for this row
+    float sum = 0.0;
+    int blocks_per_row = pc.n_blocks;
+    for (int b = 0; b < blocks_per_row; b++) {
+        uint block_offset = uint(gid * blocks_per_row + b) * BLOCK_BYTES;
+        int dim = min(BLOCK_D, pc.input_dim - b * BLOCK_D);
+        sum += dequant_dot(block_offset, dim);
+    }
+
+    out_buf.y[gid] = sum;
+}

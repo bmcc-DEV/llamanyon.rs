@@ -7,6 +7,8 @@ use crate::sampler::Sampler;
 use crate::thermal::ThermalCoordinator;
 use crate::lsc::LscPrefetcher;
 use crate::policy::PolicyEngine;
+use crate::fugu::{FuguOrchestrator, SystemSnapshot, AttentionStrategy};
+use crate::dspark::DSparkEngine;
 use tokio::sync::mpsc::Sender;
 use std::sync::Arc;
 use crate::cache::PagedKVCache;
@@ -25,7 +27,7 @@ use std::sync::OnceLock;
 
 pub static RAYON_POOL: OnceLock<ThreadPool> = OnceLock::new();
 
-fn get_rayon_pool() -> &'static ThreadPool {
+pub fn get_rayon_pool() -> &'static ThreadPool {
     RAYON_POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(6)
@@ -35,17 +37,10 @@ fn get_rayon_pool() -> &'static ThreadPool {
     })
 }
 
-/// Batched prefill: process all prompt tokens simultaneously per layer.
-///
-/// For each layer:
-///   1. Batched RMSNorm + QKV linear (all positions)
-///   2. RoPE + KV cache store (per position)
-///   3. GPU attention loop (sequential per position)
-///   4. Batched output projection + FFN (all positions)
-///
-/// Returns the last token's hidden state (x) for decode to continue from.
+/// Batch prefill helper — process a contiguous slice of prompt tokens.
+/// Returns the last token's hidden state.
 #[allow(unused_variables)]
-pub fn prefill_batch(
+fn prefill_slice(
     num_layers: usize,
     embed_dim: usize,
     num_heads: usize,
@@ -53,22 +48,21 @@ pub fn prefill_batch(
     head_dim: usize,
     ffn_dim: usize,
     rms_eps: f32,
-    prompt_tokens: &[usize],
+    tokens: &[usize],
     token_embd: &[f32],
     attn_norms: &[Vec<f32>],
     ffn_norms: &[Vec<f32>],
     model: &Model,
     kv_cache: &mut PagedKVCache,
     #[cfg(feature = "gpu")] per_layer_gpu: &mut Option<crate::scheduler::PerLayerGpuState>,
+    pos_offset: usize,
     n_threads: usize,
 ) -> Vec<f32> {
     use crate::linear::{forward_linear_batch};
     use crate::ops::{rmsnorm, silu, add_in_place, mul_in_place, apply_rope_ufc};
     use rayon::prelude::*;
 
-    let batch = prompt_tokens.len();
-
-    // Pre-allocate batched buffers
+    let batch = tokens.len();
     let mut xs: Vec<Vec<f32>> = (0..batch).map(|_| vec![0.0f32; embed_dim]).collect();
     let mut x_norms: Vec<Vec<f32>> = (0..batch).map(|_| vec![0.0f32; embed_dim]).collect();
     let mut qs: Vec<Vec<f32>> = (0..batch).map(|_| vec![0.0f32; num_heads * head_dim]).collect();
@@ -80,9 +74,8 @@ pub fn prefill_batch(
     let mut ffn_ups: Vec<Vec<f32>> = (0..batch).map(|_| vec![0.0f32; ffn_dim]).collect();
     let mut ffn_downs: Vec<Vec<f32>> = (0..batch).map(|_| vec![0.0f32; embed_dim]).collect();
 
-    // Embed all prompt tokens
     xs.par_iter_mut().enumerate().for_each(|(i, x)| {
-        let tok = prompt_tokens[i] as usize;
+        let tok = tokens[i];
         let embd_start = tok * embed_dim;
         x.copy_from_slice(&token_embd[embd_start..embd_start + embed_dim]);
     });
@@ -110,13 +103,14 @@ pub fn prefill_batch(
             forward_linear_batch(&model.gguf, v_t, &xn_refs, &mut v_refs, n_threads).ok();
         }
 
-        // 2. RoPE + KV cache store per position
+        // 2. RoPE + KV cache store (position = pos_offset + t)
         for t in 0..batch {
-            apply_rope_ufc(&mut qs[t], &mut ks[t], t, num_heads, num_kv_heads, head_dim, model.config.context_len);
-            kv_cache.save_at(l, t, &ks[t], &vs[t]);
+            let abs_pos = pos_offset + t;
+            apply_rope_ufc(&mut qs[t], &mut ks[t], abs_pos, num_heads, num_kv_heads, head_dim, model.config.context_len);
+            kv_cache.save_at(l, abs_pos, &ks[t], &vs[t]);
         }
 
-        // 3. Attention loop (sequential per position)
+        // 3. Attention loop (seq_len = pos_offset + t + 1)
         let use_gpu = {
             #[cfg(feature = "gpu")]
             { per_layer_gpu.is_some() }
@@ -127,16 +121,19 @@ pub fn prefill_batch(
             #[cfg(feature = "gpu")]
             if let Some(gpu) = per_layer_gpu {
                 for t in 0..batch {
-                    let seq_len = t + 1;
-                    gpu.execute_attention_async(&qs[t], &ks[t], &vs[t], &mut attn_outs[t], t, seq_len);
+                    let abs_pos = pos_offset + t;
+                    let seq_len = abs_pos + 1;
+                    gpu.upload_kv_async(&ks[t], &vs[t], abs_pos);
+                    gpu.execute_attention_async(&qs[t], &mut attn_outs[t], abs_pos, seq_len);
                     gpu.sync();
                 }
             }
         } else {
             for t in 0..batch {
-                let seq_len = t + 1;
-                kv_cache.ensure_pages_hot(0, seq_len / kv_cache.block_size);
-                crate::ops::attention(&mut attn_outs[t], &qs[t], kv_cache, l, seq_len, t, num_heads, num_kv_heads, head_dim);
+                let abs_pos = pos_offset + t;
+                let seq_len = abs_pos + 1;
+                kv_cache.ensure_pages_hot(0, kv_cache.page_id(seq_len.saturating_sub(1)));
+                crate::ops::attention(&mut attn_outs[t], &qs[t], kv_cache, l, seq_len, abs_pos, num_heads, num_kv_heads, head_dim);
             }
         }
 
@@ -159,17 +156,14 @@ pub fn prefill_batch(
             });
 
             let xn_refs: Vec<&[f32]> = x_norms.iter().map(|v| v.as_slice()).collect();
-
             let gate_t = model.gguf.tensor_or_err(&format!("blk.{}.ffn_gate.weight", l)).unwrap();
             let up_t = model.gguf.tensor_or_err(&format!("blk.{}.ffn_up.weight", l)).unwrap();
-
             let mut gate_refs: Vec<&mut [f32]> = ffn_gates.iter_mut().map(|v| v.as_mut_slice()).collect();
             forward_linear_batch(&model.gguf, gate_t, &xn_refs, &mut gate_refs, n_threads).ok();
             let mut up_refs: Vec<&mut [f32]> = ffn_ups.iter_mut().map(|v| v.as_mut_slice()).collect();
             forward_linear_batch(&model.gguf, up_t, &xn_refs, &mut up_refs, n_threads).ok();
         }
 
-        // Silu + mul per position
         for t in 0..batch {
             silu(&mut ffn_gates[t]);
             mul_in_place(&mut ffn_gates[t], &ffn_ups[t]);
@@ -180,13 +174,61 @@ pub fn prefill_batch(
         let mut down_refs: Vec<&mut [f32]> = ffn_downs.iter_mut().map(|v| v.as_mut_slice()).collect();
         forward_linear_batch(&model.gguf, down_t, &ffn_gate_refs, &mut down_refs, n_threads).ok();
 
-        // Residual add
         xs.par_iter_mut().zip(ffn_downs.par_iter()).for_each(|(x, fd)| {
             add_in_place(x, fd);
         });
     }
 
     xs.into_iter().last().unwrap_or_default()
+}
+
+const PREFILL_CHUNK_SIZE: usize = 4096;
+
+/// Batched prefill: process all prompt tokens, chunked to avoid OOM.
+/// Each chunk runs the full layer pipeline (QKV, RoPE, save, attention, output, FFN)
+/// with correct absolute positions, accumulating the KV cache across chunks.
+/// Returns the last token's hidden state (x) for decode to continue from.
+pub fn prefill_batch(
+    num_layers: usize,
+    embed_dim: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    ffn_dim: usize,
+    rms_eps: f32,
+    prompt_tokens: &[usize],
+    token_embd: &[f32],
+    attn_norms: &[Vec<f32>],
+    ffn_norms: &[Vec<f32>],
+    model: &Model,
+    kv_cache: &mut PagedKVCache,
+    #[cfg(feature = "gpu")] per_layer_gpu: &mut Option<crate::scheduler::PerLayerGpuState>,
+    n_threads: usize,
+) -> Vec<f32> {
+    let batch = prompt_tokens.len();
+    if batch <= PREFILL_CHUNK_SIZE {
+        return prefill_slice(
+            num_layers, embed_dim, num_heads, num_kv_heads, head_dim, ffn_dim, rms_eps,
+            prompt_tokens, token_embd, attn_norms, ffn_norms, model, kv_cache,
+            #[cfg(feature = "gpu")] per_layer_gpu,
+            0, n_threads,
+        );
+    }
+
+    let mut last_x = vec![0.0f32; embed_dim];
+    let mut offset = 0;
+    while offset < batch {
+        let end = (offset + PREFILL_CHUNK_SIZE).min(batch);
+        let chunk = &prompt_tokens[offset..end];
+        last_x = prefill_slice(
+            num_layers, embed_dim, num_heads, num_kv_heads, head_dim, ffn_dim, rms_eps,
+            chunk, token_embd, attn_norms, ffn_norms, model, kv_cache,
+            #[cfg(feature = "gpu")] per_layer_gpu,
+            offset, n_threads,
+        );
+        offset = end;
+    }
+    last_x
 }
 
 pub struct ModelExecutor {
@@ -199,6 +241,22 @@ pub struct ModelExecutor {
     pub attn_norms: Vec<Vec<f32>>,
     pub ffn_norms: Vec<Vec<f32>>,
     pub output_norm: Vec<f32>,
+}
+
+impl Clone for ModelExecutor {
+    fn clone(&self) -> Self {
+        Self {
+            model: self.model.clone(),
+            thermal_coordinator: ThermalCoordinator::default(),
+            prefetcher: LscPrefetcher::default(),
+            policy: PolicyEngine::new(&self.policy.script_path().to_string(), 6)
+                .unwrap_or_else(|_| PolicyEngine::new("", 6).unwrap()),
+            token_embd: self.token_embd.clone(),
+            attn_norms: self.attn_norms.clone(),
+            ffn_norms: self.ffn_norms.clone(),
+            output_norm: self.output_norm.clone(),
+        }
+    }
 }
 
 impl ModelExecutor {
@@ -282,22 +340,37 @@ impl ModelExecutor {
         let output_norm = self.output_norm.clone();
         let model = self.model.clone();
 
-        // Determina numero de threads via PolicyEngine (LuaJIT), com fallback para LSC
-        let c_epsilon = self.thermal_coordinator.coherence();
-        let temp_celsius = self.thermal_coordinator.current_temp as f64;
-        let freq_mhz = self.thermal_coordinator.current_freq_khz() / 1000;
-        let n_threads = self.policy.adapt_threads(c_epsilon, temp_celsius, freq_mhz);
         let policy_path = self.policy.script_path().to_string();
 
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             use crate::linear::{forward_linear, forward_linear_multi};
             use crate::ops::{rmsnorm, silu, add_in_place, mul_in_place, apply_rope_ufc};
 
+            // Thermal telemetry: read fresh inside blocking section (Idea #2)
+            let max_freq_khz = 4_400_000; // Tiger Lake-H cpuinfo_max_freq
+            let mut temp_celsius = crate::thermal::read_package_temp_celsius() as f64;
+            let mut c_epsilon = {
+                let freq = crate::thermal::read_freq_khz() as f64;
+                (freq / max_freq_khz as f64).clamp(0.0, 1.0)
+            };
+            let mut n_threads = 6;
+            // Initial thread count from thermal state
+            {
+                let t = temp_celsius;
+                let ce = c_epsilon;
+                if t > 85.0 { n_threads = 1; }
+                else if ce > 0.86 { n_threads = 6; }
+                else if ce > 0.7 { n_threads = 4; }
+                else if t > 78.0 { n_threads = 2; }
+                else { n_threads = 6; }
+            }
+
             // Local PolicyEngine for hot-reload inside the blocking thread
             let local_policy = PolicyEngine::new(&policy_path, n_threads)
                 .unwrap_or_else(|_| PolicyEngine::new("", n_threads).unwrap());
 
-            // Per-layer profiler (HLC timestamps)
+            // Per-layer profiler (HLC timestamps) — only active if SWAMP_PROFILE=1 or RUST_LOG=debug
+            crate::hlc::init_profiling();
             let mut profiler = crate::hlc::ProfileSink::new();
 
             // Buffers de estado (Forward Pass) locais para a thread bloqueante
@@ -312,6 +385,8 @@ impl ModelExecutor {
             let mut ffn_down = vec![0.0f32; embed_dim];
             let mut logits = vec![0.0f32; model.config.vocab_size];
             let mut wo_out = vec![0.0f32; embed_dim];
+            // Entropy tracker: per-position attention importance for eviction
+            let mut importance: Vec<f64> = Vec::new();
 
             // KV Cache Paginado
             let mut kv_cache = crate::cache::PagedKVCache::new(
@@ -321,44 +396,54 @@ impl ModelExecutor {
                 head_dim,
             );
 
-            // M:N Scheduler — GPU stream manager + persistent K/V buffers
-            #[cfg(feature = "gpu")]
+            // Fugu orchestrator de estratégias
+            let fugu = FuguOrchestrator::new(num_layers, num_heads, num_kv_heads, head_dim);
+
+            // DSPark cognitivo — LSH-based pattern draft + attention candidate selection
+            let mut dspark = DSparkEngine::new(embed_dim);
+            // Cross-session draft cache: load persisted patterns from NVMe (Idea #3)
+            let draft_path = std::env::var("SWAMP_DRAFT_PATH")
+                .unwrap_or_else(|_| "/tmp/swamp_draft_cache.bin".to_string());
+            dspark.load_draft_cache(&draft_path);
+            let mut draft_observations = dspark.draft_model.len;
+
+            // GPU acceleration via GpuComputeContext (runtime-fallback)
             let mut per_layer_gpu: Option<crate::scheduler::PerLayerGpuState> = {
-                let max_seq = model.config.context_len.max(2048);
-                let stream_mgr = crate::scheduler::GpuStreamManager::new(
-                    num_heads, num_kv_heads, max_seq, head_dim,
+                let window_size = 4096usize.min(model.config.context_len.max(4096));
+                let rms_eps = 1e-5_f32;
+                let mut pgs = crate::scheduler::PerLayerGpuState::new(
+                    window_size, num_heads, num_kv_heads, head_dim, num_layers,
+                    embed_dim, ffn_dim, rms_eps,
+                    vec![], vec![], vec![], vec![], vec![], vec![], vec![],
+                    std::ptr::null_mut(), std::ptr::null_mut(), 0, 0,
                 );
-                let (gpu, d_k, d_v) = match stream_mgr {
-                    Some(gpu) => {
-                        if swamp_gpu::gpu_init().is_err() {
-                            tracing::warn!("GPU init failed (falling back to CPU attention)");
-                            (None, None, None)
-                        } else {
-                            let dk = swamp_gpu::gpu_alloc_kv_buffer_half(num_kv_heads, max_seq, head_dim).ok();
-                            let dv = swamp_gpu::gpu_alloc_kv_buffer_half(num_kv_heads, max_seq, head_dim).ok();
-                            match (dk, dv) {
-                                (Some(dk_ptr), Some(dv_ptr)) => (Some(gpu), Some(dk_ptr), Some(dv_ptr)),
-                                _ => {
-                                    tracing::warn!("GPU KV buffer alloc failed (falling back to CPU attention)");
-                                    (None, None, None)
-                                }
-                            }
-                        }
-                    }
-                    None => (None, None, None),
-                };
-                gpu.map(|gpu| crate::scheduler::PerLayerGpuState {
-                    gpu: Box::new(gpu),
-                    d_k_buf: d_k.unwrap_or(std::ptr::null_mut()),
-                    d_v_buf: d_v.unwrap_or(std::ptr::null_mut()),
-                    max_seq_len: max_seq,
-                    n_kv_heads: num_kv_heads,
-                })
+                if let Some(ref mut gpu) = pgs {
+                    gpu.upload_all_weights(&model);
+                    gpu.upload_norm_weights(&attn_norms, &ffn_norms);
+                }
+                pgs
             };
 
             // PrefetchEngine for madvise-based page prefetch
             let (mmap_ptr, mmap_len) = model.gguf.mmap_ptr_and_len();
             let prefetch_engine = crate::prefetch::PrefetchEngine::new(mmap_ptr, mmap_len);
+
+            // AIMD Resource Ramp — dobra budget a cada 0.5s sem stress, corta metade no 1o sinal
+            let mut aimd = crate::aimd::AimdRamp::new();
+
+            // PowerArbiter — divide budget entre CPU threads e iGPU por RAPL+temp
+            let mut arbiter = crate::power_arbiter::PowerArbiter::new();
+
+            // StagingBuffer — workers desacoplados produzem resultado parcial em RAM compartilhada
+            // slices = num_heads para attention, slice_size = head_dim
+            let num_slices = num_kv_heads.max(1);
+            let mut staging = crate::staging::StagingBuffer::new(num_slices, head_dim);
+
+            // VirtualExpertPrefetcher: divide FFN rows em experts, DSPark-guided prefetch
+            let num_virtual_experts = 8;
+            let mut expert_prefetcher = crate::virtual_experts::VirtualExpertPrefetcher::new(
+                num_virtual_experts, ffn_dim,
+            );
 
             let mut tokens = prompt_tokens.clone();
 
@@ -390,6 +475,8 @@ impl ModelExecutor {
                     )?;
                     let next_token = sampler.sample(&logits);
                     tokens.push(next_token);
+                    // DSPark observe for the last prefill token
+                    dspark.observe_at(&last_x, next_token, n_prompt - 1);
                     let next_word = crate::tokenizer::decode(&[next_token]);
                     let _ = tx.blocking_send(next_word);
                     tokens_generated += 1;
@@ -398,6 +485,12 @@ impl ModelExecutor {
                     prefill_pos = n_prompt;
                     tracing::info!("Prefill done: {} tokens in {:.2}s", n_prompt, t_start.elapsed().as_secs_f64());
                 }
+
+                // Reset entropy tracker for this request
+                kv_cache.reset_entropy();
+
+                // DSPark-predicted cold pages for proactive prefetch
+                let mut predicted_cold_pages: Vec<usize> = Vec::new();
 
                 let total_steps = req.max_tokens + prompt_tokens.len() - 1;
                 for step in prefill_pos..total_steps {
@@ -417,113 +510,335 @@ impl ModelExecutor {
                     let embd_start = token_id * embed_dim;
                     x.copy_from_slice(&token_embd[embd_start..embd_start + embed_dim]);
 
-                    // Forward Pass: Camadas
-                    for l in 0..num_layers {
-                        // Policy check: skip layer if thermal conditions require it
-                        if local_policy.should_skip_layer(l, temp_celsius) {
-                            continue;
-                        }
+                    // Proactive DSPark-guided cold page prefetch (before layer loop)
+                    for &pid in &predicted_cold_pages {
+                        kv_cache.ensure_pages_hot(pid, pid);
+                    }
+                    predicted_cold_pages.clear();
 
+                    // Thermal telemetry + AIMD resource ramping (every 20 steps ≈ 0.5–1s)
+                    if step % 20 == 0 && step > 0 {
+                        temp_celsius = crate::thermal::read_package_temp_celsius() as f64;
+                        let freq = crate::thermal::read_freq_khz() as f64;
+                        c_epsilon = (freq / max_freq_khz as f64).clamp(0.0, 1.0);
+
+                        // Stress signals: temp > warning, freq droop, or RAPL power > 80W
+                        let stressed = temp_celsius > 80.0 || c_epsilon < 0.85;
+                        let _aimd_budget = aimd.assess(stressed);
+
+                        // PowerArbiter split: CPU vs iGPU
+                        let (cpu_frac, _igpu_frac) = arbiter.reassess(55.0);
+
+                        // Scale threads by AIMD budget + PowerArbiter CPU fraction
+                        let base_threads = if !stressed { 6 } else { 2 };
+                        n_threads = aimd.scaled_threads(base_threads);
+                        n_threads = (n_threads as f64 * cpu_frac).round().max(1.0) as usize;
+                    }
+
+                    // AIMD stress signal for Fugu (predictive throttle)
+                    let predictive_throttle = aimd.budget() < 1.0;
+
+                    // Decide Fugu strategy for this step (before layer loop)
+                    let seq_len = kv_cache.current_pos() + 1;
+                    let snapshot = SystemSnapshot {
+                        seq_len,
+                        cache_pressure: 0.0,
+                        n_prompt_tokens: prompt_tokens.len(),
+                        batch_size: aimd.concurrency(),
+                        is_prefill: false,
+                        coherence: c_epsilon,
+                        dspark_accept_rate: fugu.accept_rate(),
+                        predictive_throttle,
+                    };
+                    let strategy = fugu.decide(&snapshot);
+                    let dspark_attn_positions: Vec<usize> = match strategy.attention {
+                        AttentionStrategy::SparseWithDSPark { num_dspark, .. } => {
+                            dspark.find_attention_candidates(&x, num_dspark)
+                                .into_iter().map(|(p, _)| p).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+
+                    // Forward Pass: Camadas (group-aware for weight sharing)
+                    // Fused GPU path: async graph replay per layer, no sync until end if all fused
+                    #[cfg(feature = "gpu")]
+                    let mut fused_all_ok = per_layer_gpu.is_some();
+                    #[cfg(not(feature = "gpu"))]
+                    let mut fused_all_ok = false;
+                    if fused_all_ok {
                         #[cfg(feature = "gpu")]
-                        let mut layer_profile = profiler.begin_layer(l, per_layer_gpu.is_some());
-                        #[cfg(not(feature = "gpu"))]
-                        let mut layer_profile = profiler.begin_layer(l, false);
-
-                        // RMSNorm Attn
-                        rmsnorm(&mut x_norm, &x, &attn_norms[l], rms_eps);
-
-                        // QKV Projections FUNDIDAS (x_norm lido 1×)
-                        let q_t = model.gguf.tensor_or_err(&format!("blk.{}.attn_q.weight", l))?;
-                        let k_t = model.gguf.tensor_or_err(&format!("blk.{}.attn_k.weight", l))?;
-                        let v_t = model.gguf.tensor_or_err(&format!("blk.{}.attn_v.weight", l))?;
-                        forward_linear_multi(
-                            &model.gguf,
-                            &[q_t, k_t, v_t],
-                            &x_norm,
-                            &mut [&mut q, &mut k, &mut v],
-                            n_threads,
-                        )?;
-
-                        // RoPE
-                        apply_rope_ufc(&mut q, &mut k, pos, num_heads, num_kv_heads, head_dim, model.config.context_len);
-
-                        // KV Cache (CPU)
-                        kv_cache.save(l, &k, &v);
-                        let seq_len = kv_cache.current_pos() + 1;
-
-                        // Pre-heat KV pages from cold storage before parallel attention
-                        kv_cache.ensure_pages_hot(0, seq_len / kv_cache.block_size);
-
-                        // Attention: async stream-based GPU path via M:N scheduler
-                        #[cfg(feature = "gpu")]
-                        {
-                            let gpu_ok = per_layer_gpu.as_mut().map_or(false, |gpu| {
-                                let gpu_tic = profiler.clock().now();
-                                let launched = gpu.execute_attention_async(
-                                    &q, &k, &v, &mut attn_out, pos, seq_len,
-                                );
-                                if !launched {
-                                    return false;
-                                }
-                                let synced = gpu.sync();
-                                let gpu_toc = profiler.clock().now();
-                                if synced {
-                                    let gpu_ms = (gpu_toc.wall.saturating_sub(gpu_tic.wall)) as f64 / 1_000_000.0;
-                                    profiler.record_gpu_attention(&mut layer_profile, gpu_ms);
-                                }
-                                synced
-                            });
-                            if !gpu_ok {
-                                crate::ops::attention(&mut attn_out, &q, &mut kv_cache, l, seq_len, pos, num_heads, num_kv_heads, head_dim);
-                            }
+                        if let Some(ref mut gpu) = per_layer_gpu {
+                            gpu.upload_x(&x);
                         }
-                        #[cfg(not(feature = "gpu"))]
-                        crate::ops::attention(&mut attn_out, &q, &mut kv_cache, l, seq_len, pos, num_heads, num_kv_heads, head_dim);
+                    }
 
-                        // Output Projection
-                        forward_linear(&model.gguf, model.gguf.tensor_or_err(&format!("blk.{}.attn_output.weight", l))?, &attn_out, &mut wo_out, n_threads)?;
-                        add_in_place(&mut x, &wo_out);
+                    for group in &model.shared_groups {
+                        // Load shared tensor metadata once per group
+                        let first = group[0];
+                        let q_t = model.gguf.tensor_or_err(&format!("blk.{}.attn_q.weight", first))?;
+                        let k_t = model.gguf.tensor_or_err(&format!("blk.{}.attn_k.weight", first))?;
+                        let v_t = model.gguf.tensor_or_err(&format!("blk.{}.attn_v.weight", first))?;
+                        let o_t = model.gguf.tensor_or_err(&format!("blk.{}.attn_output.weight", first))?;
+                        let gate_t = model.gguf.tensor_or_err(&format!("blk.{}.ffn_gate.weight", first))?;
+                        let up_t = model.gguf.tensor_or_err(&format!("blk.{}.ffn_up.weight", first))?;
+                        let down_t = model.gguf.tensor_or_err(&format!("blk.{}.ffn_down.weight", first))?;
 
-                        // RMSNorm FFN
-                        rmsnorm(&mut x_norm, &x, &ffn_norms[l], rms_eps);
+                        for &l in group {
+                            // Policy check: skip layer if thermal conditions require it
+                            if local_policy.should_skip_layer(l, temp_celsius) {
+                                continue;
+                            }
 
-                        // FFN Gate & Up FUNDIDOS (x_norm lido 1×)
-                        let gate_t = model.gguf.tensor_or_err(&format!("blk.{}.ffn_gate.weight", l))?;
-                        let up_t = model.gguf.tensor_or_err(&format!("blk.{}.ffn_up.weight", l))?;
-                        forward_linear_multi(
-                            &model.gguf,
-                            &[gate_t, up_t],
-                            &x_norm,
-                            &mut [&mut ffn_gate, &mut ffn_up],
-                            n_threads,
-                        )?;
+                            #[cfg(feature = "gpu")]
+                            let mut layer_profile = profiler.begin_layer(l, per_layer_gpu.is_some());
+                            #[cfg(not(feature = "gpu"))]
+                            let mut layer_profile = profiler.begin_layer(l, false);
 
-                        silu(&mut ffn_gate);
-                        mul_in_place(&mut ffn_gate, &ffn_up);
+                            // Fused GPU layer graph: async replay on stream (no sync unless CPU fallback)
+                            #[cfg(feature = "gpu")]
+                            let layer_fused_ok: bool = if fused_all_ok {
+                                let ok = per_layer_gpu.as_mut().map_or(false, |gpu| {
+                                    let _ = gpu.create_layer_graph(l, embed_dim, ffn_dim);
+                                    gpu.execute_layer_fused(l, pos)
+                                });
+                                if !ok { fused_all_ok = false; }
+                                ok
+                            } else { false };
+                            #[cfg(not(feature = "gpu"))]
+                            let layer_fused_ok = false;
+                            if layer_fused_ok {
+                                profiler.end_layer(layer_profile);
+                                continue;
+                            }
+                            // First CPU-fallback layer: sync compute stream and download d_x to host x
+                            #[cfg(feature = "gpu")]
+                            if !fused_all_ok {
+                                if let Some(ref mut gpu) = per_layer_gpu {
+                                    gpu.sync();
+                                    gpu.download_x(&mut x);
+                                }
+                                fused_all_ok = false;
+                            }
 
-                        // FFN Down
-                        forward_linear(&model.gguf, model.gguf.tensor_or_err(&format!("blk.{}.ffn_down.weight", l))?, &ffn_gate, &mut ffn_down, n_threads)?;
-                        add_in_place(&mut x, &ffn_down);
+                            // RMSNorm Attn
+                            rmsnorm(&mut x_norm, &x, &attn_norms[l], rms_eps);
 
-                        // Prefetch next layer's tensors (madvise WILLNEED)
-                        let next = l + 1;
-                        if next < num_layers {
-                            for tensor_name in &[
-                                format!("blk.{}.attn_q.weight", next),
-                                format!("blk.{}.attn_k.weight", next),
-                                format!("blk.{}.attn_v.weight", next),
-                                format!("blk.{}.attn_output.weight", next),
-                                format!("blk.{}.ffn_gate.weight", next),
-                                format!("blk.{}.ffn_up.weight", next),
-                                format!("blk.{}.ffn_down.weight", next),
-                            ] {
-                                if let Some((off, len)) = model.gguf.tensor_raw_offset_len(tensor_name) {
-                                    prefetch_engine.prefetch_range(off, len);
+                            // QKV Projections FUNDIDAS (shared weight across group)
+                            let gemv_qkv_ok: bool = {
+                                #[cfg(feature = "gpu")]
+                                {
+                                    per_layer_gpu.as_mut().map_or(false, |gpu| {
+                                        let n_blocks = q_t.shape[0] / 256;
+                                        let ok = gpu.gemv_qkv_async(
+                                            l,
+                                            std::ptr::null_mut(),
+                                            std::ptr::null_mut(),
+                                            std::ptr::null_mut(),
+                                            &x_norm, &mut q, &mut k, &mut v,
+                                            q_t.shape[1] as i32,
+                                            k_t.shape[1] as i32,
+                                            v_t.shape[1] as i32,
+                                            n_blocks as i32,
+                                        );
+                                        ok && gpu.sync()
+                                    })
+                                }
+                                #[cfg(not(feature = "gpu"))]
+                                { false }
+                            };
+                            if !gemv_qkv_ok {
+                                forward_linear_multi(
+                                    &model.gguf,
+                                    &[q_t, k_t, v_t],
+                                    &x_norm,
+                                    &mut [&mut q, &mut k, &mut v],
+                                    n_threads,
+                                )?;
+                            }
+
+                            // RoPE
+                            apply_rope_ufc(&mut q, &mut k, pos, num_heads, num_kv_heads, head_dim, model.config.context_len);
+
+                            // KV Cache (CPU)
+                            kv_cache.save(l, &k, &v);
+                            let seq_len = kv_cache.current_pos() + 1;
+
+                            // Pre-heat KV pages from cold storage before parallel attention
+                    kv_cache.ensure_pages_hot(0, kv_cache.page_id(seq_len.saturating_sub(1)));
+
+                            // Attention dispatch via Fugu strategy
+                            let attn_dispatched: bool = {
+                                #[cfg(feature = "gpu")]
+                                {
+                                    let gpu_ok = per_layer_gpu.as_mut().map_or(false, |gpu| {
+                                        let gpu_tic = profiler.clock().now();
+                                        gpu.upload_kv_async(&k, &v, pos);
+                                        let launched = gpu.execute_attention_async(
+                                            &q, &mut attn_out, pos, seq_len,
+                                        );
+                                        if !launched {
+                                            return false;
+                                        }
+                                        let synced = gpu.sync();
+                                        let gpu_toc = profiler.clock().now();
+                                        if synced {
+                                            let gpu_ms = (gpu_toc.wall.saturating_sub(gpu_tic.wall)) as f64 / 1_000_000.0;
+                                            profiler.record_gpu_attention(&mut layer_profile, gpu_ms);
+                                        }
+                                        synced
+                                    });
+                                    if gpu_ok {
+                                        true
+                                    } else {
+                                        false // fall through to CPU dispatch
+                                    }
+                                }
+                                #[cfg(not(feature = "gpu"))]
+                                { false }
+                            };
+
+                            if !attn_dispatched {
+                                // CPU attention dispatch by Fugu strategy
+                                match strategy.attention {
+                                    AttentionStrategy::Full => {
+                                        importance.resize(seq_len, 0.0);
+                                        importance[..seq_len].fill(0.0);
+                                        crate::ops::attention_tracked(
+                                            &mut attn_out, &q, &mut kv_cache, l, seq_len, pos,
+                                            num_heads, num_kv_heads, head_dim,
+                                            &mut importance[..seq_len],
+                                        );
+                                        // Propagate entropy weights to cache pages
+                                        for (t, &w) in importance[..seq_len].iter().enumerate() {
+                                            if w > 0.001 {
+                                                kv_cache.record_importance(t, w);
+                                            }
+                                        }
+                                    }
+                                    AttentionStrategy::Sparse { window, .. } => {
+                                        crate::ops::attention_sparse(&mut attn_out, &q, &mut kv_cache, l, seq_len, pos, num_heads, num_kv_heads, head_dim, window, 64);
+                                    }
+                                    AttentionStrategy::SparseWithDSPark { window, sentinel_stride, .. } => {
+                                        crate::ops::attention_fugu(&mut attn_out, &q, &mut kv_cache, l, seq_len, pos, num_heads, num_kv_heads, head_dim, window, sentinel_stride, &dspark_attn_positions);
+                                    }
                                 }
                             }
-                        }
 
-                        profiler.end_layer(layer_profile);
+                            // Output Projection (shared weight)
+                            let gemv_o_ok: bool = {
+                                #[cfg(feature = "gpu")]
+                                {
+                                    per_layer_gpu.as_mut().map_or(false, |gpu| {
+                                        let ok = gpu.execute_gemv_async(
+                                            l,
+                                            std::ptr::null_mut(),
+                                            &attn_out, &mut wo_out,
+                                            o_t.shape[1] as i32,
+                                            (o_t.shape[0] / 256) as i32,
+                                        );
+                                        ok && gpu.sync()
+                                    })
+                                }
+                                #[cfg(not(feature = "gpu"))]
+                                { false }
+                            };
+                            if !gemv_o_ok {
+                                forward_linear(&model.gguf, o_t, &attn_out, &mut wo_out, n_threads)?;
+                            }
+                            add_in_place(&mut x, &wo_out);
+
+                            // RMSNorm FFN
+                            rmsnorm(&mut x_norm, &x, &ffn_norms[l], rms_eps);
+
+                            // FFN Gate & Up FUNDIDOS (shared weight)
+                            let gemv_gu_ok: bool = {
+                                #[cfg(feature = "gpu")]
+                                {
+                                    per_layer_gpu.as_mut().map_or(false, |gpu| {
+                                        let n_blocks = gate_t.shape[0] / 256;
+                                        let ok = gpu.gemv_gate_up_async(
+                                            l,
+                                            std::ptr::null_mut(),
+                                            std::ptr::null_mut(),
+                                            &x_norm, &mut ffn_gate, &mut ffn_up,
+                                            gate_t.shape[1] as i32,
+                                            n_blocks as i32,
+                                        );
+                                        ok && gpu.sync()
+                                    })
+                                }
+                                #[cfg(not(feature = "gpu"))]
+                                { false }
+                            };
+                            if !gemv_gu_ok {
+                                forward_linear_multi(
+                                    &model.gguf,
+                                    &[gate_t, up_t],
+                                    &x_norm,
+                                    &mut [&mut ffn_gate, &mut ffn_up],
+                                    n_threads,
+                                )?;
+                            }
+
+                            silu(&mut ffn_gate);
+                            mul_in_place(&mut ffn_gate, &ffn_up);
+
+                            // FFN Down (shared weight)
+                            let gemv_down_ok: bool = {
+                                #[cfg(feature = "gpu")]
+                                {
+                                    per_layer_gpu.as_mut().map_or(false, |gpu| {
+                                        let ok = gpu.execute_gemv_async(
+                                            l,
+                                            std::ptr::null_mut(),
+                                            &ffn_gate, &mut ffn_down,
+                                            down_t.shape[1] as i32,
+                                            (down_t.shape[0] / 256) as i32,
+                                        );
+                                        ok && gpu.sync()
+                                    })
+                                }
+                                #[cfg(not(feature = "gpu"))]
+                                { false }
+                            };
+                            if !gemv_down_ok {
+                                forward_linear(&model.gguf, down_t, &ffn_gate, &mut ffn_down, n_threads)?;
+                            }
+                            add_in_place(&mut x, &ffn_down);
+
+                            // Prefetch next group's first layer tensors (madvise WILLNEED)
+                            // Only prefetch if next layer is in a different group (different weights)
+                            let is_last_in_group = l == *group.last().unwrap();
+                            if is_last_in_group {
+                                let next = l + 1;
+                                if next < num_layers {
+                                    for tensor_name in &[
+                                        format!("blk.{}.attn_q.weight", next),
+                                        format!("blk.{}.attn_k.weight", next),
+                                        format!("blk.{}.attn_v.weight", next),
+                                        format!("blk.{}.attn_output.weight", next),
+                                        format!("blk.{}.ffn_gate.weight", next),
+                                        format!("blk.{}.ffn_up.weight", next),
+                                        format!("blk.{}.ffn_down.weight", next),
+                                    ] {
+                                        if let Some((off, len)) = model.gguf.tensor_raw_offset_len(tensor_name) {
+                                            prefetch_engine.prefetch_range(off, len);
+                                        }
+                                    }
+                                }
+                            }
+
+                            profiler.end_layer(layer_profile);
+                        }
+                    }
+
+                    // If all layers used fused graph: sync + download final x to host
+                    #[cfg(feature = "gpu")]
+                    if fused_all_ok {
+                        if let Some(ref mut gpu) = per_layer_gpu {
+                            gpu.sync();
+                            gpu.download_x(&mut x);
+                        }
                     }
 
                     // RMSNorm Final
@@ -534,8 +849,63 @@ impl ModelExecutor {
 
                     // Amostragem (só depois de preencher o cache com o prompt)
                     if step >= prompt_tokens.len() - 1 {
-                        let next_token = sampler.sample(&logits);
-                        tokens.push(next_token);
+                        let mut next_token = sampler.sample(&logits);
+
+                        // Speculative decoding: DSPark draft → reject if matches sampled token
+                        let draft_result = dspark.draft_model.draft(&x);
+                        let accepted_draft = if !draft_result.0.is_empty()
+                            && draft_result.1[0] > 0.6
+                            && draft_result.0[0] == next_token
+                        {
+                            // Draft matches sampled token — accept it (saved forward pass)
+                            Some(draft_result.0[0])
+                        } else {
+                            None
+                        };
+
+                        if accepted_draft.is_none() {
+                            tokens.push(next_token);
+                            dspark.observe_at(&x, next_token, pos);
+                        } else {
+                            tokens.push(draft_result.0[0]);
+                            dspark.observe_at(&x, draft_result.0[0], pos);
+                        }
+                        // Persist draft cache every 100 observations (Idea #3)
+                        draft_observations += 1;
+                        dspark.draft_model.save_if_due(&draft_path, draft_observations);
+
+                        // MoE Expert Prefetch: only when AIMD budget is healthy (not stressed)
+                        if aimd.budget() >= 0.5 {
+                            let lsh_hash = dspark.draft_model.hash_hidden(&x);
+                            let (start_row, end_row) = expert_prefetcher.predict_expert(lsh_hash);
+                            let num_expert_rows = end_row - start_row;
+                            if num_expert_rows > 0 {
+                                for l in 0..num_layers {
+                                    for name in &[
+                                        format!("blk.{}.ffn_gate.weight", l),
+                                        format!("blk.{}.ffn_up.weight", l),
+                                    ] {
+                                        if let Some((off, len)) = model.gguf.tensor_raw_offset_len(name) {
+                                            let row_size = len / ffn_dim;
+                                            let e_off = off + start_row * row_size;
+                                            let e_len = num_expert_rows * row_size;
+                                            prefetch_engine.prefetch_range(e_off, e_len);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // DSPark-guided cold page prefetch: predict which KV pages
+                        // will be accessed in upcoming steps and start loading them
+                        let next_pages = dspark.predict_cold_pages(
+                            &x, pos, 3, 4096, 4096,
+                            |p| kv_cache.page_id(p),
+                        );
+                        predicted_cold_pages.extend(next_pages);
+                        predicted_cold_pages.sort();
+                        predicted_cold_pages.dedup();
+                        predicted_cold_pages.truncate(64);
 
                         let next_word = crate::tokenizer::decode(&[next_token]);
                         
@@ -547,6 +917,9 @@ impl ModelExecutor {
                     }
                     
                     kv_cache.advance();
+
+                    // Reset staging buffer for next token
+                    staging.reset_all();
                 }
                 
                 let elapsed = t_start.elapsed().as_secs_f64();
@@ -570,5 +943,90 @@ impl ModelExecutor {
             Ok(Err(e)) => Err(e),
             Err(e) => Err(anyhow::anyhow!("Join Error: {:?}", e)),
         }
+    }
+
+    /// Pipeline concurrente: processa até `max_concurrency` requests em paralelo,
+    /// sobrepondo prefill de uma com decode de outra via pipeline parallelism.
+    /// Cada request roda em sua própria thread com KV cache independente.
+    pub fn generate_batch(
+        &self,
+        requests: Vec<InferenceRequest>,
+        max_concurrency: usize,
+    ) -> Vec<anyhow::Result<String>> {
+        use std::sync::{mpsc, Arc, Mutex};
+        use std::thread;
+
+        let n = requests.len();
+        if n == 0 { return Vec::new(); }
+
+        let results: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(vec![None; n]));
+        let errors: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(vec![None; n]));
+
+        // Use a shared queue with mutex
+        let job_queue: Arc<Mutex<Vec<(usize, InferenceRequest)>>> = Arc::new(Mutex::new(
+            requests.into_iter().enumerate().collect()
+        ));
+
+        let mut handles = Vec::with_capacity(max_concurrency);
+        for _ in 0..max_concurrency.min(n) {
+            let jq = job_queue.clone();
+            let res = results.clone();
+            let errs = errors.clone();
+            let model = self.model.clone();
+            let token_embd = self.token_embd.clone();
+            let attn_norms = self.attn_norms.clone();
+            let ffn_norms = self.ffn_norms.clone();
+            let output_norm = self.output_norm.clone();
+            let policy_script = self.policy.script_path().to_string();
+
+            handles.push(thread::spawn(move || {
+                loop {
+                    let job = {
+                        let mut q = jq.lock().unwrap();
+                        q.pop()
+                    };
+                    let (idx, req) = match job {
+                        Some(j) => j,
+                        None => break,
+                    };
+                    let executor = ModelExecutor {
+                        model: model.clone(),
+                        thermal_coordinator: ThermalCoordinator::default(),
+                        prefetcher: LscPrefetcher::default(),
+                        policy: PolicyEngine::new(&policy_script, 6).unwrap_or_else(|_| PolicyEngine::new("", 6).unwrap()),
+                        token_embd: token_embd.clone(),
+                        attn_norms: attn_norms.clone(),
+                        ffn_norms: ffn_norms.clone(),
+                        output_norm: output_norm.clone(),
+                    };
+                    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+                    let result = tokio::runtime::Runtime::new()
+                        .unwrap()
+                        .block_on(async move {
+                            let mut exec = executor;
+                            let _ = exec.generate(req, tx.clone()).await;
+                            let mut output = String::new();
+                            while let Some(msg) = rx.blocking_recv() {
+                                output.push_str(&msg);
+                            }
+                            output
+                        });
+                    let mut r = res.lock().unwrap();
+                    r[idx] = Some(result);
+                }
+            }));
+        }
+
+        for h in handles {
+            let _ = h.join();
+        }
+
+        let final_results = results.lock().unwrap();
+        final_results.iter().map(|r| {
+            match r {
+                Some(s) => Ok(s.clone()),
+                None => Err(anyhow::anyhow!("request failed")),
+            }
+        }).collect()
     }
 }

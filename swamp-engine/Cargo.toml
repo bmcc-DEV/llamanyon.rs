@@ -3,6 +3,10 @@ name = "swamp-engine"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["gpu"]
+gpu = []
+
 [dependencies]
 swamp-gguf = { path = "../swamp-gguf" }
 swamp-tensors = { path = "../swamp-tensors" }
@@ -15,10 +19,9 @@ tokenizers = "0.23.1"
 serde = { workspace = true, features = ["derive"] }
 mlua = { workspace = true }
 tracing = { workspace = true }
-libc = "0.2"
 half = { workspace = true }
-swamp-gpu = { path = "../swamp-gpu", optional = true }
-
-[features]
-default = []
-gpu = ["swamp-gpu"]
+libc = { workspace = true }
+swamp-gpu = { path = "../swamp-gpu" }
+ash = { workspace = true }
+crossbeam = "0.8.4"
+parking_lot = "0.12.5"

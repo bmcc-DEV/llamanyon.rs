@@ -7,7 +7,7 @@ use swamp_gguf::GgufFile;
 
 #[derive(Parser)]
 #[command(name = "swamp-inspect")]
-#[command(about = "LLamanyon.rs - inspeciona modelos GGUF")]
+#[command(about = "Swamp - inspeciona modelos GGUF")]
 struct Cli {
     /// Caminho para o arquivo .gguf
     model: String,
@@ -35,7 +35,7 @@ fn main() -> Result<()> {
     let gguf = GgufFile::open(&cli.model)?;
 
     // Cabecalho
-    println!("=== LLamanyon.rs - swamp-inspect ===");
+    println!("=== Swamp - swamp-inspect ===");
     println!("Arquivo:       {}", cli.model);
     println!("Arquitetura:   {}", gguf.architecture());
     println!("Tensores:      {}", gguf.n_tensors());

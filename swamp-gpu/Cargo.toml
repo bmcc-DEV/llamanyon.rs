@@ -7,6 +7,13 @@ edition = "2021"
 name = "swamp_gpu"
 
 [dependencies]
+ash = { workspace = true }
+swamp-tensors = { path = "../swamp-tensors" }
 libloading = "0.8"
 thiserror = "2"
 tracing = "0.1"
+parking_lot = { workspace = true }
+crossbeam = { workspace = true }
+
+[build-dependencies]
+capnpc = "0.19"

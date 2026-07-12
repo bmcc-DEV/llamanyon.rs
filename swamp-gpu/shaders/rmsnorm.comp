@@ -1,0 +1,52 @@
+#version 460
+
+// RMS Normalization
+// Each workgroup normalizes one vector
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    int n;
+    float eps;
+} pc;
+
+layout(set = 0, binding = 0) buffer XBuf { float x[]; };
+layout(set = 0, binding = 1) buffer WBuf { float w[]; };
+layout(set = 0, binding = 2) buffer OutBuf { float out[]; };
+
+shared float sq_sum_scratch[256];
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint n = uint(pc.n);
+
+    // Compute RMS: sqrt(mean(x^2) + eps)
+    float local_sq = 0.0;
+    if (gid < n) {
+        local_sq = x[gid] * x[gid];
+    }
+    sq_sum_scratch[lid] = local_sq;
+    barrier();
+
+    // Reduction
+    for (uint i = 128; i > 0; i >>= 1) {
+        if (lid < i) {
+            sq_sum_scratch[lid] += sq_sum_scratch[lid + i];
+        }
+        barrier();
+    }
+
+    if (lid == 0) {
+        float mean_sq = sq_sum_scratch[0] / float(n);
+        sq_sum_scratch[0] = 1.0 / sqrt(mean_sq + pc.eps);
+    }
+    barrier();
+
+    float rms_scale = sq_sum_scratch[0];
+
+    // Apply normalization
+    if (gid < n) {
+        out[gid] = x[gid] * rms_scale * w[gid];
+    }
+}

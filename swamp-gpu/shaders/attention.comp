@@ -1,0 +1,121 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+
+// FlashAttention-style kernel
+// Each workgroup handles one head
+// Q in registers, K/V in global memory with shared memory tiling
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    int n_heads;
+    int n_kv_heads;
+    int seq_len;
+    int head_dim;
+    int kv_stride;
+} pc;
+
+layout(set = 0, binding = 0) buffer QBuf { float q[]; };
+layout(set = 0, binding = 1) buffer KBuf { float k[]; };
+layout(set = 0, binding = 2) buffer VBuf { float v[]; };
+layout(set = 0, binding = 3) buffer ScoresBuf { float scores[]; };
+layout(set = 0, binding = 4) buffer OutBuf { float out[]; };
+
+shared float tile_k[64][64];  // tile of K
+shared float tile_v[64][64];  // tile of V
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (head >= uint(pc.n_heads)) return;
+
+    uint head_dim = uint(pc.head_dim);
+    uint seq_len = uint(pc.seq_len);
+    uint kv_stride = uint(pc.kv_stride);
+
+    // Q head offset
+    uint q_off = head * head_dim;
+
+    // Online softmax state
+    float m = -1e10;
+    float d = 0.0;
+    float scale = 1.0 / sqrt(float(head_dim));
+
+    // Accumulator for output
+    float acc[64];
+    for (int i = 0; i < 64 && i < int(head_dim); i++) {
+        acc[i] = 0.0;
+    }
+
+    // Tile over KV sequence
+    uint num_tiles = (seq_len + 63) / 64;
+    for (uint t = 0; t < num_tiles; t++) {
+        uint tile_start = t * 64;
+        uint tile_end = min(tile_start + 64, seq_len);
+        uint tile_len = tile_end - tile_start;
+
+        // Cooperative load K tile into shared memory
+        for (uint i = lid; i < tile_len * head_dim; i += 64) {
+            uint pos = tile_start + i / head_dim;
+            uint dim = i % head_dim;
+            tile_k[i / head_dim][i % head_dim] = k[pos * kv_stride + dim + q_off];
+        }
+
+        // Cooperative load V tile
+        for (uint i = lid; i < tile_len * head_dim; i += 64) {
+            uint pos = tile_start + i / head_dim;
+            uint dim = i % head_dim;
+            tile_v[i / head_dim][i % head_dim] = v[pos * kv_stride + dim + q_off];
+        }
+        barrier();
+
+        // Compute scores for this tile
+        float tile_max = -1e10;
+        float tile_scores[64];
+        if (lid < tile_len) {
+            float s = 0.0;
+            for (uint d = 0; d < head_dim; d++) {
+                s += q[q_off + d] * tile_k[lid][d];
+            }
+            s *= scale;
+            tile_scores[lid] = s;
+            tile_max = max(tile_max, s);
+        }
+
+        barrier();
+
+        // Online softmax merge
+        float tile_d = 0.0;
+        if (lid < tile_len) {
+            tile_d = exp(tile_scores[lid] - tile_max);
+        }
+
+        // Warp-level reduction for tile_d
+        for (uint i = 16; i > 0; i >>= 1) {
+            tile_d += __shfl_xor_sync(0xFFFFFFFF, tile_d, i, 32);
+        }
+
+        if (lid == 0) {
+            float new_m = max(m, tile_max);
+            d = d * exp(m - new_m) + tile_d * exp(tile_max - new_m);
+            m = new_m;
+        }
+        barrier();
+
+        // Accumulate weighted V
+        if (lid < tile_len) {
+            float w = exp(tile_scores[lid] - m) / d;
+            if (w > 1e-8) {
+                for (uint d = 0; d < head_dim; d++) {
+                    acc[d] += w * tile_v[lid][d];
+                }
+            }
+        }
+        barrier();
+    }
+
+    // Write output
+    for (uint d = lid; d < head_dim; d += 64) {
+        out[head * head_dim + d] = acc[d];
+    }
+}

@@ -1,0 +1,56 @@
+#version 460
+
+// Rotary Position Embedding (RoPE) — in-place on Q and K
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    int pos;
+    int head_dim;
+    int n_heads;
+    int n_kv_heads;
+} pc;
+
+layout(set = 0, binding = 0) buffer QBuf { float q[]; };
+layout(set = 0, binding = 1) buffer KBuf { float k[]; };
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint head_dim = uint(pc.head_dim);
+    uint half_dim = head_dim / 2;
+
+    // Each thread handles one (head, half) pair
+    uint total_pairs = uint(pc.n_heads + pc.n_kv_heads) * half_dim;
+    if (gid >= total_pairs) return;
+
+    float pos_f = float(pc.pos);
+    bool is_q = gid < uint(pc.n_heads) * half_dim;
+
+    uint head;
+    uint half_idx;
+    float* buf;
+    if (is_q) {
+        head = gid / half_dim;
+        half_idx = gid % half_dim;
+        buf = q;
+    } else {
+        uint kv_gid = gid - uint(pc.n_heads) * half_dim;
+        head = kv_gid / half_dim;
+        half_idx = kv_gid % half_dim;
+        buf = k;
+    }
+
+    uint offset = head * head_dim;
+    float freq = pos_f / pow(10000.0, 2.0 * float(half_idx) / float(head_dim));
+    float cos_val = cos(freq);
+    float sin_val = sin(freq);
+
+    uint i0 = offset + half_idx;
+    uint i1 = offset + half_idx + half_dim;
+
+    float x0 = buf[i0];
+    float x1 = buf[i1];
+
+    buf[i0] = x0 * cos_val - x1 * sin_val;
+    buf[i1] = x0 * sin_val + x1 * cos_val;
+}

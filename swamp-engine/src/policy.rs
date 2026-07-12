@@ -1,36 +1,95 @@
-// swamp-engine/src/policy.rs
-// LuaJIT Policy Engine: decisoes termicas e de agendamento hot-reloadable
-
-use mlua::{Lua, Result as LuaResult, Value};
-use std::sync::{Arc, Mutex, atomic::{AtomicI64, Ordering}};
+use mlua::{Lua, Result as LuaResult, Value, UserData, UserDataMethods};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
+use crate::control_plane::{CommandQueue, Command, ResourceHandle, TensorCreateCmd};
+use swamp_tensors::hma::DType;
+
 pub struct PolicyEngine {
-    lua: Arc<Mutex<Lua>>,
+    lua: Arc<std::sync::Mutex<Lua>>,
     script_path: String,
     last_load_ns: AtomicI64,
     fallback_threads: usize,
+    command_queue: Option<Arc<CommandQueue>>,
 }
 
 impl PolicyEngine {
     pub fn new(script_path: &str, fallback_threads: usize) -> LuaResult<Self> {
         let lua = Lua::new();
 
-        // Sandbox: limitar acesso a APIs perigosas
         lua.load("os = nil; io = nil; debug = nil").exec()?;
 
         let engine = Self {
-            lua: Arc::new(Mutex::new(lua)),
+            lua: Arc::new(std::sync::Mutex::new(lua)),
             script_path: script_path.to_string(),
             last_load_ns: AtomicI64::new(0),
             fallback_threads,
+            command_queue: None,
         };
 
         if !script_path.is_empty() {
             engine.reload()?;
         }
         Ok(engine)
+    }
+
+    pub fn set_command_queue(&mut self, cq: Arc<CommandQueue>) -> LuaResult<()> {
+        self.command_queue = Some(cq.clone());
+        let lua = self.lua.lock().unwrap();
+
+        let gpu_module = lua.create_table()?;
+        let tensor_table = lua.create_table()?;
+
+        let cq_clone = cq.clone();
+        let create_fn = lua.create_function(move |_, (shape, dtype_str): (Vec<f64>, String)| {
+            let shape_usize: Vec<usize> = shape.iter().map(|&s| s as usize).collect();
+            let dtype = match dtype_str.as_str() {
+                "f32" => DType::F32,
+                "f16" => DType::F16,
+                "q4k" => DType::Q4K,
+                "q6k" => DType::Q6K,
+                _ => DType::F32,
+            };
+            let id = ResourceHandle::new();
+            let mut dims = [0usize; 4];
+            for (i, &d) in shape_usize.iter().enumerate().take(4) {
+                dims[i] = d;
+            }
+            cq_clone.push(Command::TensorCreate(TensorCreateCmd {
+                tag: 1,
+                id: id.0,
+                dims,
+                ndim: shape_usize.len() as u32,
+                dtype: dtype as u32,
+                location: 0,
+                _pad: 0,
+            }));
+            Ok(id.0 as f64)
+        })?;
+        tensor_table.set("create", create_fn)?;
+        gpu_module.set("tensor", tensor_table)?;
+
+        let cq_clone2 = cq.clone();
+        let commit_fn = lua.create_function(move |_, ()| {
+            static FRAME_ID: AtomicI64 = AtomicI64::new(0);
+            let frame_id = FRAME_ID.fetch_add(1, Ordering::Relaxed);
+            cq_clone2.push(Command::Commit(super::control_plane::CommitCmd {
+                tag: 6,
+                frame_id: frame_id as u64,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+                _pad: 0,
+            }));
+            Ok(())
+        })?;
+        gpu_module.set("commit", commit_fn)?;
+
+        lua.globals().set("gpu", gpu_module)?;
+        Ok(())
     }
 
     pub fn reload(&self) -> LuaResult<()> {

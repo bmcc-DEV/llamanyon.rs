@@ -1,209 +1,152 @@
 # swamp-gpu/kernels/attention.mojo
-# GPU attention: QK^T softmax + weighted sum of V
-# Uses cuBLAS for batched GEMM, custom fused softmax kernel
+# Mojo 1.0.0b2 — FlashAttention-style sparse attention (CPU AVX-512)
+# Tile-based online softmax + weighted sum. Zero CUDA.
 
-from sys import int8, int32, float32, float64
-from memory import memset_zero, memcmp, DType, UnsafePointer
-from platform import CUDA
-from algorithm import parallelize, vectorize
+from math import exp, sqrt, max, abs_f
 
 # ---------------------------------------------------------------------------
-# CUDA kernel: fused softmax + scale (online, numerically stable)
+# 4-bit KV block: per block of 32 values → d(f16)+dmin(f16)+16 nibbles = 20 bytes
 # ---------------------------------------------------------------------------
-fn softmax_kernel[block_dim: Int = 256](
-    scores: UnsafePointer[float32],    # [n_heads, seq_len] scores
-    output: UnsafePointer[float32],    # [n_heads, seq_len] probabilities
-    n_heads: Int,
-    seq_len: Int,
-    scale: float32,
-    grid_dim_x: Int,
-    grid_dim_y: Int,
-):
-    tid = block_dim * (blockIdx.x + gridDim.x * blockIdx.y) + threadIdx.x
+comptime BLOCK_D: Int = 32
+comptime BLOCK_BYTES: Int = 20  # d(2)+dmin(2)+nibbles(16)
+comptime TILE_KV: Int = 64      # positions per tile (cache-friendly)
+comptime HEAD_DIM: Int = 64
 
-    if tid >= n_heads * seq_len:
-        return
-
-    h = tid // seq_len
-    t = tid %  seq_len
-
-    # Row pointer
-    row = scores.offset(h * seq_len)
-
-    # Find max for numerical stability
-    var max_val: float32 = -1e10
-    for i in range(seq_len):
-        v = row.load(i)
-        if v > max_val:
-            max_val = v
-
-    # Compute exp(x - max) and sum
-    var sum_exp: float32 = 0.0
-    for i in range(seq_len):
-        sum_exp += (row.load(i) - max_val).exp()
-
-    # Normalize
-    inv_sum = 1.0 / sum_exp
-    output.store(tid, (row.load(t) - max_val).exp() * inv_sum)
-    return
+# ---------------------------------------------------------------------------
+# Dequantize one 4-bit KV block and dot with Q
+# ---------------------------------------------------------------------------
+@always_inline
+def dequant_dot(
+    q: Pointer[Float32],       # [BLOCK_D] query
+    k_q4: Pointer[Float32],   # {d,dmin,nibbles} (stored as f32 for simplicity)
+    dim: Int,                   # actual dimension (<= BLOCK_D)
+) -> Float32:
+    var d = k_q4.load(0)
+    var dmin = k_q4.load(1)
+    var result: Float32 = 0.0
+    for i in range(dim):
+        var nib_ptr = k_q4.offset(2 + i // 2)
+        var shift = (i % 2) * 4
+        var nib = (nib_ptr[].to_int() >> shift) & 0x0F
+        var k_val = d * Float32(nib) + dmin
+        result += k_val * q.load(i)
+    return result
 
 
 # ---------------------------------------------------------------------------
-# CUDA kernel: weighted sum of V with attention probabilities
-# out[h, d] = sum_t probs[h, t] * V[t, d]
+# FlashAttention: online softmax + weighted sum for one head
 # ---------------------------------------------------------------------------
-fn weighted_sum_kernel[block_dim: Int = 256](
-    probs: UnsafePointer[float32],     # [n_heads, seq_len]
-    v_cache: UnsafePointer[float32],    # [n_kv_heads, seq_len, head_dim]
-    output: UnsafePointer[float32],     # [n_heads, head_dim]
-    n_heads: Int,
-    n_kv_heads: Int,
-    seq_len: Int,
+@always_inline
+def flash_attn_head(
+    q_head: Pointer[Float32],       # [head_dim]
+    k_q4: Pointer[Float32],         # [n_positions, head_dim_q4]
+    v_q4: Pointer[Float32],
+    positions: Pointer[Int32],       # [n_sparse]
+    n_positions: Int,
     head_dim: Int,
-    grid_dim_x: Int,
-    grid_dim_y: Int,
+    scale: Float32,
+    out: Pointer[Float32],           # [head_dim]
 ):
-    tid = block_dim * (blockIdx.x + gridDim.x * blockIdx.y) + threadIdx.x
+    # Tile over sparse positions
+    var m: Float32 = -1e10   # running max (online softmax)
+    var d: Float32 = 0.0     # running denominator
+    var blocks = (head_dim + BLOCK_D - 1) // BLOCK_D
+    var blk_bytes = blocks * BLOCK_BYTES
 
-    if tid >= n_heads * head_dim:
-        return
+    # Per-head output buffer
+    for d_i in range(head_dim):
+        out.store(d_i, 0.0)
 
-    h = tid // head_dim
-    d = tid %  head_dim
-    kv_h = h * n_kv_heads // n_heads
+    var t_start = 0
+    while t_start < n_positions:
+        var t_end = min(t_start + TILE_KV, n_positions)
+        var n_tile = t_end - t_start
 
-    var acc: float32 = 0.0
-    probs_row = probs.offset(h * seq_len)
-    v_slice  = v_cache.offset(kv_h * seq_len * head_dim)
+        # Score tile
+        var max_score: Float32 = -1e10
+        var scores = Pointer[Float32].alloc(n_tile)
 
-    for t in range(seq_len):
-        acc += probs_row.load(t) * v_slice.load(t * head_dim + d)
+        for pos_idx in range(n_tile):
+            var t_pos = positions.load(t_start + pos_idx)
+            var k_off = t_pos * blk_bytes
+            var dot: Float32 = 0.0
+            for blk in range(blocks):
+                var kd = k_q4.load(k_off + blk * BLOCK_BYTES)
+                var kdmin = k_q4.load(k_off + blk * BLOCK_BYTES + 1)
+                var qq = q_head.offset(blk * BLOCK_D)
+                var kv = k_q4.offset(k_off + blk * BLOCK_BYTES)
+                for i in range(BLOCK_D):
+                    if blk * BLOCK_D + i >= head_dim: break
+                    var nib_ptr = kv.offset(2 + i // 2)
+                    var shift = (i % 2) * 4
+                    var nib = (nib_ptr[].to_int() >> shift) & 0x0F
+                    var k_val = kd * Float32(nib) + kdmin
+                    dot += k_val * qq.load(i)
+            var sc = dot * scale
+            scores.store(pos_idx, sc)
+            if sc > max_score: max_score = sc
 
-    output.store(tid, acc)
-    return
+        # Online softmax merge
+        var tile_d: Float32 = 0.0
+        for pos_idx in range(n_tile):
+            tile_d += exp(scores.load(pos_idx) - max_score)
+
+        var new_m = max(m, max_score)
+        d = d * exp(m - new_m) + tile_d * exp(max_score - new_m)
+        m = new_m
+
+        # Weighted sum of V for this tile
+        for pos_idx in range(n_tile):
+            var w = exp(scores.load(pos_idx) - m) / d
+            if w < 1e-8: continue
+            var t_pos = positions.load(t_start + pos_idx)
+            var v_off = t_pos * blk_bytes
+            for blk in range(blocks):
+                var vd = v_q4.load(v_off + blk * BLOCK_BYTES)
+                var vdmin = v_q4.load(v_off + blk * BLOCK_BYTES + 1)
+                vv = v_q4.offset(v_off + blk * BLOCK_BYTES)
+                for i in range(BLOCK_D):
+                    if blk * BLOCK_D + i >= head_dim: break
+                    var nib_ptr = vv.offset(2 + i // 2)
+                    var shift = (i % 2) * 4
+                    var nib = (nib_ptr[].to_int() >> shift) & 0x0F
+                    var v_val = vd * Float32(nib) + vdmin
+                    var out_i = blk * BLOCK_D + i
+                    out.store(out_i, out.load(out_i) + v_val * w)
+
+        scores.free()
 
 
 # ---------------------------------------------------------------------------
-# Fused flash attention (one kernel, tile-based)
+# Host-callable entry point
 # ---------------------------------------------------------------------------
-fn flash_attn_kernel[block_dim: Int = 256](
-    q: UnsafePointer[float32],         # [n_heads, head_dim]
-    k_cache: UnsafePointer[float32],   # [n_kv_heads, seq_len, head_dim]
-    v_cache: UnsafePointer[float32],   # [n_kv_heads, seq_len, head_dim]
-    output: UnsafePointer[float32],    # [n_heads, head_dim]
+@export
+def sparse_attention_q4(
+    q_ptr: Int,                 # raw pointer (passed as Int for FFI)
+    k_q4_ptr: Int,
+    v_q4_ptr: Int,
+    positions_ptr: Int,
+    out_ptr: Int,
     n_heads: Int,
-    n_kv_heads: Int,
-    seq_len: Int,
     head_dim: Int,
-    scale: float32,
-    grid_dim_x: Int,
-    grid_dim_y: Int,
+    n_sparse: Int,
+    window: Int,
+    global_stride: Int,
 ):
-    tid = block_dim * (blockIdx.x + gridDim.x * blockIdx.y) + threadIdx.x
+    var q = Pointer[Float32](q_ptr)
+    var k_q4 = Pointer[Float32](k_q4_ptr)
+    var v_q4 = Pointer[Float32](v_q4_ptr)
+    var positions = Pointer[Int32](positions_ptr)
+    var output = Pointer[Float32](out_ptr)
+    var scale = 1.0 / sqrt(Float32(head_dim))
 
-    if tid >= n_heads:
-        return
-
-    h = tid
-    kv_h = h * n_kv_heads // n_heads
-
-    # Shared memory for tile results (not available in Mojo with simple pointers)
-
-    # Registers for online softmax
-    var max_val: float32 = -1e10
-    var sum_exp: float32 = 0.0
-
-    q_ptr = q.offset(h * head_dim)
-
-    for t in range(seq_len):
-        k_ptr = k_cache.offset(kv_h * seq_len * head_dim + t * head_dim)
-
-        # Dot product Q * K^T
-        var score: float32 = 0.0
-        for d in range(head_dim):
-            score += q_ptr.load(d) * k_ptr.load(d)
-        score *= scale
-
-        # Online softmax update
-        var new_max = max_val.max(score)
-        var exp_val = (score - new_max).exp()
-        sum_exp = sum_exp * (max_val - new_max).exp() + exp_val
-        max_val = new_max
-
-        # Store score for weighted sum (in registers)
-        # For a tile-based approach, we'd store in shared memory
-        # Simplified: directly accumulate V weighted by exp(score - max)
-        # This requires a second pass over K, but for simplicity:
-        # Store scores in a temporary location (would need global mem)
-
-        # For now: placeholder for the fused kernel
-        pass
-
-    # Normalize and compute weighted sum
-    inv_sum = 1.0 / sum_exp
-    var acc: float32 = 0.0
-
-    for d in range(head_dim):
-        output.store(h * head_dim + d, output.load(h * head_dim + d))
-
-    return
-
-
-# ---------------------------------------------------------------------------
-# Host-callable entry points (exported as C-compatible functions)
-# ---------------------------------------------------------------------------
-
-@export
-fn cuda_available() -> Bool:
-    return CUDA.is_available
-
-
-@export
-fn attention_qk(
-    q_dev: UnsafePointer[float32],
-    k_dev: UnsafePointer[float32],
-    scores_dev: UnsafePointer[float32],
-    n_heads: Int,
-    n_kv_heads: Int,
-    seq_len: Int,
-    head_dim: Int,
-    scale: float32,
-):
-    # Batch matmul: scores[h, t] = Q[h, :] @ K[kv_h, t, :]
-    # Each head computes dot products with all key positions
-    n_total = n_heads * seq_len
-    grid_dim_x = (n_total + 255) // 256
-    grid_dim_y = 1
-
-    # TODO: Use cuBLAS for batched GEMM
-    # For now: simple dot product kernel
-    pass
-
-
-@export
-fn attention_weighted_sum(
-    probs_dev: UnsafePointer[float32],
-    v_dev: UnsafePointer[float32],
-    out_dev: UnsafePointer[float32],
-    n_heads: Int,
-    n_kv_heads: Int,
-    seq_len: Int,
-    head_dim: Int,
-):
-    n_total = n_heads * head_dim
-    grid_dim_x = (n_total + 255) // 256
-    grid_dim_y = 1
-    # Launch weighted_sum_kernel (handled by Mojo runtime)
-    pass
-
-
-# ---------------------------------------------------------------------------
-# Simple GPU info utility
-# ---------------------------------------------------------------------------
-
-@export
-fn get_gpu_name() -> String:
-    if not CUDA.is_available:
-        return String("CUDA not available")
-    var name = String("GTX 1650 Mobile (detected)")
-    return name
+    for h in range(n_heads):
+        var q_off = h * head_dim
+        var out_off = h * head_dim
+        flash_attn_head(
+            q.offset(q_off),
+            k_q4, v_q4,
+            positions, n_sparse,
+            head_dim, scale,
+            output.offset(out_off),
+        )

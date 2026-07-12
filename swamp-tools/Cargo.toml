@@ -25,13 +25,14 @@ name = "benchmark-q4k-batched"
 path = "src/bin/benchmark_q4k_batched.rs"
 
 [features]
-gpu = ["swamp-engine/gpu", "dep:swamp-gpu"]
+gpu = ["swamp-engine/gpu"]
 
 [dependencies]
 swamp-gguf    = { path = "../swamp-gguf" }
 swamp-engine  = { path = "../swamp-engine" }
 swamp-kernels = { path = "../swamp-kernels" }
-swamp-gpu = { path = "../swamp-gpu", optional = true }
+swamp-gpu = { path = "../swamp-gpu" }
 anyhow = { workspace = true }
 clap   = { workspace = true }
 half   = { workspace = true }
+tokio  = { workspace = true }

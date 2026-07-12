@@ -1,5 +1,22 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Global flag: profiling is enabled only when RUST_LOG=debug or SWAMP_PROFILE=1.
+/// Saves ~64 atomic CAS + ~2 allocations per decode step when disabled.
+static PROFILING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Call once at startup to enable profiling (e.g. when RUST_LOG=debug).
+pub fn init_profiling() {
+    let enabled = std::env::var("SWAMP_PROFILE").ok().as_deref() == Some("1")
+        || std::env::var("RUST_LOG").ok()
+            .map(|v| v.contains("debug") || v.contains("trace"))
+            .unwrap_or(false);
+    PROFILING_ENABLED.store(enabled, Ordering::Release);
+}
+
+fn profiling_enabled() -> bool {
+    PROFILING_ENABLED.load(Ordering::Acquire)
+}
 
 // ---------------------------------------------------------------------------
 // WallClock: TSC-based monotonic clock calibrated to nanoseconds
@@ -308,6 +325,9 @@ impl ProfileSink {
     }
 
     pub fn begin_layer(&mut self, layer: usize, gpu_expected: bool) -> LayerTiming {
+        if !profiling_enabled() {
+            return LayerTiming::default();
+        }
         let ts = self.clock.now();
         LayerTiming {
             layer,
@@ -319,6 +339,7 @@ impl ProfileSink {
     }
 
     pub fn end_layer(&mut self, mut timing: LayerTiming) {
+        if !profiling_enabled() { return; }
         let ts = self.clock.now();
         timing.wall_end = ts;
         timing.elapsed_ns = ts.wall.saturating_sub(timing.wall_start.wall);
@@ -326,10 +347,12 @@ impl ProfileSink {
     }
 
     pub fn record_gpu_attention(&mut self, timing: &mut LayerTiming, elapsed_ms: f64) {
+        if !profiling_enabled() { return; }
         timing.gpu_attention_ms = Some(elapsed_ms);
     }
 
     pub fn is_empty(&self) -> bool {
+        if !profiling_enabled() { return true; }
         self.layers.is_empty()
     }
 
@@ -418,11 +441,13 @@ mod tests {
 
     #[test]
     fn test_profile_sink() {
+        PROFILING_ENABLED.store(true, Ordering::Release);
         let mut sink = ProfileSink::new();
         let t = sink.begin_layer(0, false);
         std::thread::sleep(Duration::from_micros(500));
         sink.end_layer(t);
         let report = sink.report();
+        PROFILING_ENABLED.store(false, Ordering::Release);
         assert!(report.contains("1 layers"));
         assert!(report.contains("avg"));
     }

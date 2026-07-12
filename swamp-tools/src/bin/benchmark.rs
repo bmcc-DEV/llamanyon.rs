@@ -9,7 +9,7 @@ use swamp_gguf::GgufFile;
 
 #[derive(Parser)]
 #[command(name = "swamp-benchmark")]
-#[command(about = "LLamanyon.rs - benchmark de dequantizacao de tensores")]
+#[command(about = "Swamp - benchmark de dequantizacao de tensores")]
 struct Cli {
     model: String,
 

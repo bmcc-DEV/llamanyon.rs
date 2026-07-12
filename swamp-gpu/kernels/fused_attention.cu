@@ -855,4 +855,494 @@ void gpu_event_destroy(cudaEvent_t event) {
     cudaEventDestroy(event);
 }
 
+
+// ---------------------------------------------------------------------------
+// Q4_K GEMV: dequantize on-the-fly, VNNI-style dot product
+// Each block: 256 threads, each processes one output row
+// W: [n_rows, n_blocks * 144] Q4_K in VRAM
+// x: [n_cols] f32 activation
+// out: [n_rows] f32 output
+// ---------------------------------------------------------------------------
+__global__ void kernel_gemv_q4k(
+    const uint8_t* __restrict__ w,       // Q4_K weights in VRAM
+    const float*   __restrict__ x,       // activation vector
+    float*         __restrict__ out,     // output vector
+    int n_rows,
+    int n_blocks,
+    float scale_x,
+    float inv_scale_x
+) {
+    // x is pre-quantized to i8 on host, stored as f32 for simplicity
+    // Each thread processes 1 row
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+
+    float total = 0.0f;
+    for (int blk = 0; blk < n_blocks; blk++) {
+        const uint8_t* blk_ptr = w + ((size_t)row * n_blocks + blk) * 144;
+        
+        // Load d/dmin as f16
+        half d_h = *reinterpret_cast<const half*>(blk_ptr);
+        half dmin_h = *reinterpret_cast<const half*>(blk_ptr + 2);
+        float d = __half2float(d_h);
+        float dmin = __half2float(dmin_h);
+        
+        // Unpack scales (12 bytes → 8+8)
+        float scales[8], mins[8];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            scales[j] = (blk_ptr[4 + j] & 63);
+            mins[j]   = (blk_ptr[8 + j] & 63);
+        }
+        #pragma unroll
+        for (int j = 4; j < 8; j++) {
+            scales[j] = (blk_ptr[8 + j] & 0xF) | ((blk_ptr[4 + j - 4] >> 6) << 4);
+            mins[j]   = (blk_ptr[8 + j] >> 4) | ((blk_ptr[4 + j] >> 6) << 4);
+        }
+        
+        // Process 8 sub-blocks of 32 values each
+        const uint8_t* qs = blk_ptr + 16;
+        float dot = 0.0f;
+        float dot_corr = 0.0f;
+        
+        for (int sb = 0; sb < 8; sb++) {
+            float sum_x = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < 32; k++) {
+                int nib = (qs[sb * 16 + k / 2] >> ((k % 2) * 4)) & 0x0F;
+                float w_val = d * (nib - 8) * scales[sb] + dmin * mins[sb];
+                float xk = x[blk * 256 + sb * 32 + k];
+                dot += w_val * xk;
+            }
+        }
+        total += dot;
+    }
+    out[row] = total;
+}
+
+void gpu_gemv_q4k(
+    const uint8_t* d_w, const float* d_x, float* d_out,
+    int n_rows, int n_blocks,
+    cudaStream_t stream
+) {
+    int threads = 256;
+    int blocks = (n_rows + threads - 1) / threads;
+    kernel_gemv_q4k<<<blocks, threads, 0, stream>>>(d_w, d_x, d_out, n_rows, n_blocks, 0.0f, 0.0f);
+}
+
+// Upload weights to GPU (ring buffer)
+void gpu_upload_weights(const uint8_t* h_w, uint8_t** d_w, size_t bytes, cudaStream_t stream) {
+    cudaMalloc(d_w, bytes);
+    cudaMemcpyAsync(*d_w, h_w, bytes, cudaMemcpyHostToDevice, stream);
+}
+
+void gpu_free_weights(uint8_t* d_w) {
+    cudaFree(d_w);
+}
+
+// Copy activation vector to GPU and run GEMV, copy result back
+void gpu_gemv_q4k_full(
+    const uint8_t* d_w, const float* h_x, float* h_out,
+    int n_rows, int n_blocks, cudaStream_t stream
+) {
+    size_t x_bytes = (size_t)n_blocks * 256 * sizeof(float);
+    size_t out_bytes = (size_t)n_rows * sizeof(float);
+    float *d_x, *d_out;
+    cudaMalloc(&d_x, x_bytes);
+    cudaMalloc(&d_out, out_bytes);
+    cudaMemcpyAsync(d_x, h_x, x_bytes, cudaMemcpyHostToDevice, stream);
+    int threads = 256;
+    int blocks = (n_rows + threads - 1) / threads;
+    kernel_gemv_q4k<<<blocks, threads, 0, stream>>>(d_w, d_x, d_out, n_rows, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_out, d_out, out_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaFree(d_x);
+    cudaFree(d_out);
+}
+
+// GEMV with pre-allocated buffers (no malloc per call)
+void gpu_gemv_q4k_prealloc(
+    const uint8_t* d_w, const float* h_x, float* h_out,
+    float* d_x, float* d_out,
+    int n_rows, int n_blocks, int max_n_rows, int max_n_cols,
+    cudaStream_t stream
+) {
+    size_t x_bytes = (size_t)n_blocks * 256 * sizeof(float);
+    size_t out_bytes = (size_t)n_rows * sizeof(float);
+    cudaMemcpyAsync(d_x, h_x, x_bytes, cudaMemcpyHostToDevice, stream);
+    int threads = 256;
+    int blocks = (n_rows + threads - 1) / threads;
+    kernel_gemv_q4k<<<blocks, threads, 0, stream>>>(d_w, d_x, d_out, n_rows, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_out, d_out, out_bytes, cudaMemcpyDeviceToHost, stream);
+}
+
+void gpu_alloc_buffers(float** d_x, float** d_out, int max_cols, int max_rows, cudaStream_t stream) {
+    cudaMalloc(d_x, (size_t)max_cols * sizeof(float));
+    cudaMalloc(d_out, (size_t)max_rows * sizeof(float));
+}
+
+void gpu_free_buffers(float* d_x, float* d_out) {
+    cudaFree(d_x);
+    cudaFree(d_out);
+}
+// ===========================================================================
+// Swamp Continuum: meta-kernel CUDA persistente
+// Lê opcodes de um ring buffer em device memory. Nunca retorna.
+// CPU publica opcodes de 32 bytes. GPU interpreta e executa.
+// ===========================================================================
+
+struct __align__(32) SwampOpcode {
+    uint8_t  op;             // 0=GEMV_Q4K, 1=ATTN_SPARSE, 2=FFN_SILU_MUL
+    uint8_t  flags;
+    uint16_t layer_id;
+    uint32_t x_offset;       // offset no buffer persistente de input
+    uint32_t w_offset;       // offset nos pesos Q4_K
+    uint32_t out_offset;     // offset no buffer persistente de output
+    uint16_t rows;
+    uint16_t cols;
+    uint16_t n_blocks;
+    uint16_t head_dim;
+    uint8_t  reserved[6];
+};
+
+// Ring buffer produtor-consumidor (GPU lê, CPU escreve)
+struct SwampRingBuffer {
+    volatile uint32_t head;   // GPU consumiu até aqui
+    volatile uint32_t tail;   // CPU escreveu até aqui
+    SwampOpcode slots[1024];  // opcodes circulares
+};
+
+// Buffer persistente de estados (x, out) — GPU mantém entre opcodes
+#define MAX_STATE_SIZE (4 * 1024 * 1024) // 4MB de estados em VRAM
+
+// ---------------------------------------------------------------------------
+// Processa um opcode GEMV_Q4K
+// ---------------------------------------------------------------------------
+__device__ void exec_gemv_q4k(
+    const SwampOpcode* op,
+    const uint8_t* d_w_base,
+    float* d_state
+) {
+    const uint8_t* w = d_w_base + op->w_offset;
+    float* x = d_state + op->x_offset;
+    float* out = d_state + op->out_offset;
+    int n_rows = op->rows;
+    int n_blocks = op->n_blocks;
+
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+
+    float total = 0.0f;
+    for (int blk = 0; blk < n_blocks; blk++) {
+        const uint8_t* blk_ptr = w + ((size_t)row * n_blocks + blk) * 144;
+        half d_h = *reinterpret_cast<const half*>(blk_ptr);
+        half dmin_h = *reinterpret_cast<const half*>(blk_ptr + 2);
+        float d = __half2float(d_h);
+        float dmin = __half2float(dmin_h);
+
+        float scales[8], mins[8];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            scales[j] = (blk_ptr[4 + j] & 63);
+            mins[j]   = (blk_ptr[8 + j] & 63);
+        }
+        #pragma unroll
+        for (int j = 4; j < 8; j++) {
+            scales[j] = (blk_ptr[8 + j] & 0xF) | ((blk_ptr[4 + j - 4] >> 6) << 4);
+            mins[j]   = (blk_ptr[8 + j] >> 4) | ((blk_ptr[4 + j] >> 6) << 4);
+        }
+
+        const uint8_t* qs = blk_ptr + 16;
+        float dot = 0.0f;
+        for (int sb = 0; sb < 8; sb++) {
+            for (int k = 0; k < 32; k++) {
+                int nib = (qs[sb * 16 + k / 2] >> ((k % 2) * 4)) & 0x0F;
+                float w_val = d * (nib - 8) * scales[sb] + dmin * mins[sb];
+                dot += w_val * x[blk * 256 + sb * 32 + k];
+            }
+        }
+        total += dot;
+    }
+    out[row] = total;
+}
+
+// ---------------------------------------------------------------------------
+// Persistent kernel: processa opcodes em loop infinito
+// ---------------------------------------------------------------------------
+__global__ void swamp_continuum(
+    SwampRingBuffer* ring,
+    const uint8_t* d_w_base,
+    float* d_state,
+    volatile int* shutdown_flag
+) {
+    // Shared memory: thread 0 publica o opcode atual, todos os threads executam
+    __shared__ SwampOpcode shared_op;
+    __shared__ volatile int op_ready;
+
+    while (true) {
+        if (shutdown_flag && *shutdown_flag) return;
+
+        // Thread 0: gerencia ring buffer
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            uint32_t tail = ring->tail;
+            uint32_t head = ring->head;
+
+            if (head != tail) {
+                uint32_t slot = head & 1023;
+                shared_op = ring->slots[slot];
+                op_ready = 1;
+            } else {
+                op_ready = 0;
+            }
+        }
+
+        __syncthreads();
+
+        if (!op_ready) continue;
+
+        // Todos os threads executam o GEMV
+        if (shared_op.op == 0) {
+            exec_gemv_q4k(&shared_op, d_w_base, d_state);
+        }
+
+        __syncthreads();
+
+        // Thread 0: avança head
+        if (threadIdx.x == 0) {
+            if (shared_op.op == 1) return; // SHUTDOWN
+            __threadfence_system();
+            ring->head = ring->head + 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host-callable wrappers
+// ---------------------------------------------------------------------------
+
+void gpu_swamp_init(
+    SwampRingBuffer** d_ring,
+    float** d_state,
+    int** d_shutdown,
+    cudaStream_t stream
+) {
+    cudaMalloc((void**)d_ring, sizeof(SwampRingBuffer));
+    cudaMemset((void*)*d_ring, 0, sizeof(SwampRingBuffer));
+    cudaMalloc((void**)d_state, MAX_STATE_SIZE);
+    cudaMemset((void*)*d_state, 0, MAX_STATE_SIZE);
+    cudaMalloc((void**)d_shutdown, sizeof(int));
+    cudaMemset((void*)*d_shutdown, 0, sizeof(int));
+}
+
+// Buffer pinned para opcodes (alocado uma vez, reutilizado)
+static SwampOpcode* pinned_op_buf = NULL;
+
+void gpu_swamp_alloc_pinned() {
+    if (pinned_op_buf == NULL) {
+        cudaHostAlloc(&pinned_op_buf, sizeof(SwampOpcode), cudaHostAllocDefault);
+    }
+}
+
+void gpu_swamp_launch(
+    SwampRingBuffer* d_ring,
+    const uint8_t* d_w_base,
+    float* d_state,
+    int* d_shutdown,
+    cudaStream_t kernel_stream  // stream DEDICADO (nunca sincronizado)
+) {
+    int sm_count;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
+    if (sm_count < 1) sm_count = 1;
+    swamp_continuum<<<sm_count, 256, 0, kernel_stream>>>(d_ring, d_w_base, d_state, d_shutdown);
+    gpu_swamp_alloc_pinned();
+}
+
+void gpu_swamp_free_pinned() {
+    if (pinned_op_buf) cudaFreeHost(pinned_op_buf);
+}
+
+// Enfileira opcode via stream de dados (NÃO o stream do kernel)
+void gpu_swamp_enqueue(
+    SwampRingBuffer* d_ring,
+    int op_type, int layer_id,
+    int x_off, int w_off, int out_off,
+    int rows, int n_blocks,
+    unsigned int local_tail,
+    cudaStream_t data_stream
+) {
+    if (!pinned_op_buf) return;
+
+    // Preenche opcode no buffer pinned
+    pinned_op_buf->op = op_type;
+    pinned_op_buf->layer_id = layer_id;
+    pinned_op_buf->x_offset = x_off;
+    pinned_op_buf->w_offset = w_off;
+    pinned_op_buf->out_offset = out_off;
+    pinned_op_buf->rows = rows;
+    pinned_op_buf->n_blocks = n_blocks;
+
+    // Copia opcode para o ring buffer no device (via data_stream)
+    cudaMemcpyAsync(
+        &d_ring->slots[local_tail & 1023],
+        pinned_op_buf, sizeof(SwampOpcode),
+        cudaMemcpyHostToDevice,
+        data_stream
+    );
+
+    // Publica tail (kernel vê via __threadfence_system)
+    unsigned int new_tail = local_tail + 1;
+    cudaMemcpyAsync(
+        (void*)(&d_ring->tail),
+        &new_tail, sizeof(unsigned int),
+        cudaMemcpyHostToDevice,
+        data_stream
+    );
+}
+
+// Leitura de resultado do device para host (síncrono no data_stream)
+void gpu_swamp_readback(float* dst, float* src, size_t bytes, cudaStream_t data_stream) {
+    cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, data_stream);
+    cudaStreamSynchronize(data_stream);
+}
+
+// Sinaliza shutdown do kernel persistente
+void gpu_swamp_shutdown(int* d_shutdown, cudaStream_t stream) {
+    int val = 1;
+    cudaMemcpyAsync(d_shutdown, &val, sizeof(int), cudaMemcpyHostToDevice, stream);
+}
+
+// Sync stream (only if not already defined elsewhere)
+int gpu_stream_sync(cudaStream_t stream) {
+    cudaError_t e = cudaStreamSynchronize(stream);
+    return (int)e;
+}
+
+// ===========================================================================
+// CUDA Graph: GEMV QKV batch — captures copy x + 3 GEMVs + 3 copy backs
+// All host pointers must be stable (pinned or fixed Vec), all device ptrs pre-alloc
+// ===========================================================================
+void* gpu_graph_create_gemv_qkv(
+    const uint8_t* d_w_q, const uint8_t* d_w_k, const uint8_t* d_w_v,
+    float* d_x, float* d_out,
+    const float* h_x, float* h_q, float* h_k, float* h_v,
+    int n_rows_q, int n_rows_k, int n_rows_v, int n_blocks,
+    int x_bytes, int out_bytes_q, int out_bytes_k, int out_bytes_v
+) {
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    cudaGraph_t graph;
+    cudaGraphCreate(&graph, 0);
+
+    int blocks_q = (n_rows_q + 255) / 256;
+    int blocks_k = (n_rows_k + 255) / 256;
+    int blocks_v = (n_rows_v + 255) / 256;
+
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+
+    cudaMemcpyAsync(d_x, h_x, x_bytes, cudaMemcpyHostToDevice, stream);
+    kernel_gemv_q4k<<<blocks_q, 256, 0, stream>>>(d_w_q, d_x, d_out, n_rows_q, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_q, d_out, out_bytes_q, cudaMemcpyDeviceToHost, stream);
+    kernel_gemv_q4k<<<blocks_k, 256, 0, stream>>>(d_w_k, d_x, d_out, n_rows_k, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_k, d_out, out_bytes_k, cudaMemcpyDeviceToHost, stream);
+    kernel_gemv_q4k<<<blocks_v, 256, 0, stream>>>(d_w_v, d_x, d_out, n_rows_v, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_v, d_out, out_bytes_v, cudaMemcpyDeviceToHost, stream);
+
+    cudaError_t err = cudaStreamEndCapture(stream, &graph);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_graph_create_gemv_qkv: capture failed: %s\n", cudaGetErrorString(err));
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+    cudaGraphExec_t graph_exec;
+    err = cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_graph_create_gemv_qkv: instantiate failed: %s\n", cudaGetErrorString(err));
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    return (void*)graph_exec;
+}
+
+// CUDA Graph: Gate+Up GEMV batch — copies x once, 2 kernels, 2 copy backs
+void* gpu_graph_create_gemv_gate_up(
+    const uint8_t* d_w_gate, const uint8_t* d_w_up,
+    float* d_x, float* d_out,
+    const float* h_x, float* h_gate, float* h_up,
+    int n_rows, int n_blocks,
+    int x_bytes, int out_bytes
+) {
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    cudaGraph_t graph;
+    cudaGraphCreate(&graph, 0);
+
+    int blocks = (n_rows + 255) / 256;
+
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+
+    cudaMemcpyAsync(d_x, h_x, x_bytes, cudaMemcpyHostToDevice, stream);
+    kernel_gemv_q4k<<<blocks, 256, 0, stream>>>(d_w_gate, d_x, d_out, n_rows, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_gate, d_out, out_bytes, cudaMemcpyDeviceToHost, stream);
+    kernel_gemv_q4k<<<blocks, 256, 0, stream>>>(d_w_up, d_x, d_out, n_rows, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_up, d_out, out_bytes, cudaMemcpyDeviceToHost, stream);
+
+    cudaError_t err = cudaStreamEndCapture(stream, &graph);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_graph_create_gemv_gate_up: capture failed: %s\n", cudaGetErrorString(err));
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+    cudaGraphExec_t graph_exec;
+    err = cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0);
+    if (err != cudaSuccess) {
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    return (void*)graph_exec;
+}
+
+// CUDA Graph: single GEMV — copy x + kernel + copy out
+void* gpu_graph_create_gemv_single(
+    const uint8_t* d_w,
+    float* d_x, float* d_out,
+    const float* h_x, float* h_out,
+    int n_rows, int n_blocks,
+    int x_bytes, int out_bytes
+) {
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    cudaGraph_t graph;
+    cudaGraphCreate(&graph, 0);
+
+    int blocks = (n_rows + 255) / 256;
+
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+
+    cudaMemcpyAsync(d_x, h_x, x_bytes, cudaMemcpyHostToDevice, stream);
+    kernel_gemv_q4k<<<blocks, 256, 0, stream>>>(d_w, d_x, d_out, n_rows, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_out, d_out, out_bytes, cudaMemcpyDeviceToHost, stream);
+
+    cudaError_t err = cudaStreamEndCapture(stream, &graph);
+    if (err != cudaSuccess) {
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+    cudaGraphExec_t graph_exec;
+    err = cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0);
+    if (err != cudaSuccess) {
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    return (void*)graph_exec;
+}
+
 } // extern "C"

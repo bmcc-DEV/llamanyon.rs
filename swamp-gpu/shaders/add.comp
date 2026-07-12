@@ -1,0 +1,20 @@
+#version 460
+
+// Element-wise vector addition: out = a + b
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    int n;
+} pc;
+
+layout(set = 0, binding = 0) buffer ABuf { float a[]; };
+layout(set = 0, binding = 1) buffer BBuf { float b[]; };
+layout(set = 0, binding = 2) buffer OutBuf { float out[]; };
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uint(pc.n)) return;
+
+    out[gid] = a[gid] + b[gid];
+}

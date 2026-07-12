@@ -90,8 +90,12 @@ impl Sampler {
             }
         }
 
-        // Fallback
-        logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(idx, _)| idx).unwrap_or(0)
+        // Fallback (filtra NaN)
+        logits.iter().enumerate()
+            .filter(|(_, &v)| v.is_finite())
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
     }
 }
 

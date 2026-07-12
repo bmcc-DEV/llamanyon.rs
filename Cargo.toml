@@ -27,6 +27,9 @@ prometheus = "0.13"
 rand = "0.8"
 clap = { version = "4.4", features = ["derive"] }
 libc = "0.2"
+ash = "0.38"
+crossbeam = "0.8"
+parking_lot = "0.12"
 
 [profile.release]
 lto = "fat"

@@ -102,217 +102,146 @@ unsafe fn fused_gemv_q4k_vnni(
     w_raw: &[u8], x: &[f32], out: &mut [f32],
     n_rows: usize, _n_cols: usize, n_blocks: usize,
 ) {
-    let xor_mask = _mm512_set1_epi8(-128i8); // i8 -> u8: flip bit de sinal
+    let xor_mask = _mm512_set1_epi8(-128i8);
     let mask_nibble = _mm_set1_epi8(0x0F);
     let eight = _mm_set1_epi8(8i8);
 
-    // Arrays temporarios para o bloco atual de x
-    let mut x_i8_buf = [0i8; 256];
-    let mut sum_x_subblocks = [0i32; 8];
-    let mut va_fulls = [_mm512_setzero_si512(); 8];
+    // Phase 1: pre-quantize ALL x with single global scale_x
+    let n_x = n_blocks * Q4K_BLOCK_SIZE;
+    let mut x_i8_all = vec![0i8; n_x];
+    let mut pq_va = vec![0u8; n_blocks * 8 * 64]; // [blk][sb][64 bytes]
+    let mut pq_sum_x = vec![0i32; n_blocks * 8];
 
-    // Loop externo: blocos de pesos (colunas / 256)
-    // Inversao de loop (column-first): quantiza x_blk UMA VEZ para todas as linhas
+    let mut max_abs = _mm512_setzero_ps();
+    let abs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFF_FFFF));
+    let mut j = 0;
+    while j + 16 <= n_x {
+        let v = _mm512_loadu_ps(x.as_ptr().add(j));
+        max_abs = _mm512_max_ps(max_abs, _mm512_and_ps(v, abs_mask));
+        j += 16;
+    }
+    let mut buf16 = [0.0f32; 16];
+    _mm512_storeu_ps(buf16.as_mut_ptr(), max_abs);
+    let global_max = buf16.iter().cloned().fold(0.0f32, f32::max);
+    let inv_scale_x = if global_max > 1e-6 { 127.0 / global_max } else { 0.0 };
+    let scale_x     = if global_max > 1e-6 { global_max / 127.0 } else { 1.0 };
+
+    j = 0;
+    while j + 16 <= n_x {
+        let vx  = _mm512_loadu_ps(x.as_ptr().add(j));
+        let vi  = _mm512_cvtps_epi32(_mm512_mul_ps(vx, _mm512_set1_ps(inv_scale_x)));
+        let vi8 = _mm512_cvtepi32_epi8(vi);
+        _mm_storeu_si128(x_i8_all.as_mut_ptr().add(j) as *mut __m128i, vi8);
+        j += 16;
+    }
+
+    // Build pre-quantized va_full and sum_x for each (blk, sb)
     for blk in 0..n_blocks {
-        let x_blk = &x[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-
-        // 1. Quantiza o bloco de x para INT8
-        let mut max_abs = _mm512_setzero_ps();
-        let abs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFF_FFFF));
-        let mut j = 0;
-        while j + 16 <= 256 {
-            let v = _mm512_loadu_ps(x_blk.as_ptr().add(j));
-            max_abs = _mm512_max_ps(max_abs, _mm512_and_ps(v, abs_mask));
-            j += 16;
-        }
-        let mut buf16 = [0.0f32; 16];
-        _mm512_storeu_ps(buf16.as_mut_ptr(), max_abs);
-        let x_max = buf16.iter().cloned().fold(0.0f32, f32::max);
-        let inv_scale_x = if x_max > 1e-6 { 127.0 / x_max } else { 0.0 };
-        let scale_x     = if x_max > 1e-6 { x_max / 127.0 } else { 1.0 };
-
-        j = 0;
-        while j + 16 <= 256 {
-            let vx  = _mm512_loadu_ps(x_blk.as_ptr().add(j));
-            let vi  = _mm512_cvtps_epi32(_mm512_mul_ps(vx, _mm512_set1_ps(inv_scale_x)));
-            let vi8 = _mm512_cvtepi32_epi8(vi);
-            _mm_storeu_si128(x_i8_buf.as_mut_ptr().add(j) as *mut __m128i, vi8);
-            j += 16;
-        }
-
-        // 2. Pre-calcula as somas de sub-blocos de x_i8 e carrega para ZMM (usados pelo VNNI e Bias)
         for sb in 0..8 {
-            let sb_off = sb * 32;
+            let sb_off = blk * Q4K_BLOCK_SIZE + sb * 32;
             let mut sum = 0i32;
-            for k in 0..32 {
-                sum += x_i8_buf[sb_off + k] as i32;
-            }
-            sum_x_subblocks[sb] = sum;
+            for k in 0..32 { sum += x_i8_all[sb_off + k] as i32; }
+            pq_sum_x[blk * 8 + sb] = sum;
 
-            let va_lo = _mm256_loadu_si256(x_i8_buf.as_ptr().add(sb_off) as *const __m256i);
-            let va_hi = _mm256_loadu_si256(x_i8_buf.as_ptr().add(sb_off + 16) as *const __m256i);
-            va_fulls[sb] = _mm512_inserti64x4(_mm512_castsi256_si512(va_lo), va_hi, 1);
+            let va_lo = _mm256_loadu_si256(x_i8_all.as_ptr().add(sb_off) as *const __m256i);
+            let va_hi = _mm256_loadu_si256(x_i8_all.as_ptr().add(sb_off + 16) as *const __m256i);
+            let va = _mm512_inserti64x4(_mm512_castsi256_si512(va_lo), va_hi, 1);
+            _mm512_storeu_si512(pq_va.as_mut_ptr().add((blk * 8 + sb) * 64) as *mut __m512i, va);
+        }
+    }
+
+    // Phase 2: sequential row processing, single quire across all superblocks
+    let row_stride = n_blocks * Q4K_BLOCK_BYTES;
+    for row in 0..n_rows {
+        let mut quire = _mm512_setzero_si512();
+        let mut total_dc = 0.0f32;
+        let row_off = row * row_stride;
+
+        // Prefetch next row's weight data while processing current row
+        if row + 1 < n_rows {
+            let next_row_off = (row + 1) * row_stride;
+            for blk in 0..n_blocks.min(4) {
+                let prefetch_addr = w_raw.as_ptr().add(next_row_off + blk * Q4K_BLOCK_BYTES) as *const i8;
+                _mm_prefetch::<_MM_HINT_T0>(prefetch_addr);
+            }
         }
 
-        // 3. Loop interno: processa 4 linhas simultaneamente (maximiza IPC / reuso de registradores)
-        let mut row = 0;
-        while row + 4 <= n_rows {
-            let mut quire0 = _mm512_setzero_si512();
-            let mut quire1 = _mm512_setzero_si512();
-            let mut quire2 = _mm512_setzero_si512();
-            let mut quire3 = _mm512_setzero_si512();
-
-            let mut dot_corr0 = 0.0f32;
-            let mut dot_corr1 = 0.0f32;
-            let mut dot_corr2 = 0.0f32;
-            let mut dot_corr3 = 0.0f32;
-
-            let base0 = (row * n_blocks + blk) * Q4K_BLOCK_BYTES;
-            let base1 = ((row + 1) * n_blocks + blk) * Q4K_BLOCK_BYTES;
-            let base2 = ((row + 2) * n_blocks + blk) * Q4K_BLOCK_BYTES;
-            let base3 = ((row + 3) * n_blocks + blk) * Q4K_BLOCK_BYTES;
-
-            // Prefetch agressivo para a proxima iteracao (strided prefetch)
-            if blk + 1 < n_blocks {
-                _mm_prefetch(w_raw.as_ptr().add(base0 + Q4K_BLOCK_BYTES) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(w_raw.as_ptr().add(base1 + Q4K_BLOCK_BYTES) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(w_raw.as_ptr().add(base2 + Q4K_BLOCK_BYTES) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(w_raw.as_ptr().add(base3 + Q4K_BLOCK_BYTES) as *const i8, _MM_HINT_T0);
-            }
-
-            let d0 = f16::from_le_bytes([w_raw[base0], w_raw[base0 + 1]]).to_f32();
-            let dmin0 = f16::from_le_bytes([w_raw[base0 + 2], w_raw[base0 + 3]]).to_f32();
-            let sc0 = &w_raw[base0 + 4..base0 + 16];
-            let qs0 = w_raw.as_ptr().add(base0 + 16);
-
-            let d1 = f16::from_le_bytes([w_raw[base1], w_raw[base1 + 1]]).to_f32();
-            let dmin1 = f16::from_le_bytes([w_raw[base1 + 2], w_raw[base1 + 3]]).to_f32();
-            let sc1 = &w_raw[base1 + 4..base1 + 16];
-            let qs1 = w_raw.as_ptr().add(base1 + 16);
-
-            let d2 = f16::from_le_bytes([w_raw[base2], w_raw[base2 + 1]]).to_f32();
-            let dmin2 = f16::from_le_bytes([w_raw[base2 + 2], w_raw[base2 + 3]]).to_f32();
-            let sc2 = &w_raw[base2 + 4..base2 + 16];
-            let qs2 = w_raw.as_ptr().add(base2 + 16);
-
-            let d3 = f16::from_le_bytes([w_raw[base3], w_raw[base3 + 1]]).to_f32();
-            let dmin3 = f16::from_le_bytes([w_raw[base3 + 2], w_raw[base3 + 3]]).to_f32();
-            let sc3 = &w_raw[base3 + 4..base3 + 16];
-            let qs3 = w_raw.as_ptr().add(base3 + 16);
-
-            let (scales0, mins0) = unpack_scales_q4k(sc0);
-            let (scales1, mins1) = unpack_scales_q4k(sc1);
-            let (scales2, mins2) = unpack_scales_q4k(sc2);
-            let (scales3, mins3) = unpack_scales_q4k(sc3);
-
-            for sb in 0..8 {
-                let sum_x = sum_x_subblocks[sb] as f32 * scale_x;
-                
-                let sv_f0 = d0 * (scales0[sb] & 0x3F) as f32;
-                let mv_f0 = dmin0 * (mins0[sb] & 0x3F) as f32;
-                dot_corr0 += mv_f0 * sum_x + (128.0 + 8.0) * sum_x * sv_f0;
-
-                let sv_f1 = d1 * (scales1[sb] & 0x3F) as f32;
-                let mv_f1 = dmin1 * (mins1[sb] & 0x3F) as f32;
-                dot_corr1 += mv_f1 * sum_x + (128.0 + 8.0) * sum_x * sv_f1;
-
-                let sv_f2 = d2 * (scales2[sb] & 0x3F) as f32;
-                let mv_f2 = dmin2 * (mins2[sb] & 0x3F) as f32;
-                dot_corr2 += mv_f2 * sum_x + (128.0 + 8.0) * sum_x * sv_f2;
-
-                let sv_f3 = d3 * (scales3[sb] & 0x3F) as f32;
-                let mv_f3 = dmin3 * (mins3[sb] & 0x3F) as f32;
-                dot_corr3 += mv_f3 * sum_x + (128.0 + 8.0) * sum_x * sv_f3;
-
-                let va_full = va_fulls[sb];
-
-                macro_rules! process_row {
-                    ($qs:expr, $quire:expr) => {
-                        let packed = _mm_loadu_si128($qs.add(sb * 16) as *const __m128i);
-                        let lo_nib = _mm_and_si128(packed, mask_nibble);
-                        let hi_nib = _mm_and_si128(_mm_srli_epi16(packed, 4), mask_nibble);
-                        let lo_i8 = _mm_sub_epi8(lo_nib, eight);
-                        let hi_i8 = _mm_sub_epi8(hi_nib, eight);
-                        let w_256 = _mm256_set_m128i(hi_i8, lo_i8);
-                        let w_512 = _mm512_inserti64x4(_mm512_castsi256_si512(w_256), w_256, 1);
-                        let vw_u8 = _mm512_xor_si512(w_512, xor_mask);
-                        $quire = _mm512_dpbusd_epi32($quire, vw_u8, va_full);
-                    }
-                }
-
-                process_row!(qs0, quire0);
-                process_row!(qs1, quire1);
-                process_row!(qs2, quire2);
-                process_row!(qs3, quire3);
-            }
-
-            // Colapsa os 4 quires via macro auxiliar
-            macro_rules! collapse_quire {
-                ($quire:expr) => {{
-                    let lo = _mm512_castsi512_si256($quire);
-                    let hi = std::mem::transmute(_mm512_extracti64x4_epi64($quire, 1));
-                    let s256 = _mm256_add_epi32(lo, hi);
-                    let lo128 = _mm256_castsi256_si128(s256);
-                    let hi128 = _mm256_extracti128_si256(s256, 1);
-                    let s128 = _mm_add_epi32(lo128, hi128);
-                    let s64 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
-                    let s32 = _mm_add_epi32(s64, _mm_srli_si128(s64, 4));
-                    _mm_cvtsi128_si32(s32)
-                }}
-            }
-
-            out[row]     += collapse_quire!(quire0) as f32 * scale_x - dot_corr0;
-            out[row + 1] += collapse_quire!(quire1) as f32 * scale_x - dot_corr1;
-            out[row + 2] += collapse_quire!(quire2) as f32 * scale_x - dot_corr2;
-            out[row + 3] += collapse_quire!(quire3) as f32 * scale_x - dot_corr3;
-
-            row += 4;
-        }
-
-        // Remainder loop para as linhas restantes (se houver)
-        while row < n_rows {
-            let mut quire = _mm512_setzero_si512();
-            let mut dot_corr = 0.0f32;
-            let base = (row * n_blocks + blk) * Q4K_BLOCK_BYTES;
+        for blk in 0..n_blocks {
+            let base = row_off + blk * Q4K_BLOCK_BYTES;
             let d    = f16::from_le_bytes([w_raw[base],     w_raw[base + 1]]).to_f32();
             let dmin = f16::from_le_bytes([w_raw[base + 2], w_raw[base + 3]]).to_f32();
             let sc   = &w_raw[base + 4..base + 16];
             let qs   = w_raw.as_ptr().add(base + 16);
-
             let (scales, mins) = unpack_scales_q4k(sc);
 
-            for sb in 0..8 {
-                let sv_f = d * (scales[sb] & 0x3F) as f32;
-                let mv_f = dmin * (mins[sb] & 0x3F) as f32;
-                let sum_x = sum_x_subblocks[sb] as f32 * scale_x;
-                dot_corr += mv_f * sum_x + (128.0 + 8.0) * sum_x * sv_f;
+            // Preload all 8 va_full for this blk
+            let va0 = _mm512_loadu_si512(pq_va.as_ptr().add((blk * 8) * 64) as *const __m512i);
+            let va1 = _mm512_loadu_si512(pq_va.as_ptr().add((blk * 8 + 1) * 64) as *const __m512i);
+            let va2 = _mm512_loadu_si512(pq_va.as_ptr().add((blk * 8 + 2) * 64) as *const __m512i);
+            let va3 = _mm512_loadu_si512(pq_va.as_ptr().add((blk * 8 + 3) * 64) as *const __m512i);
+            let va4 = _mm512_loadu_si512(pq_va.as_ptr().add((blk * 8 + 4) * 64) as *const __m512i);
+            let va5 = _mm512_loadu_si512(pq_va.as_ptr().add((blk * 8 + 5) * 64) as *const __m512i);
+            let va6 = _mm512_loadu_si512(pq_va.as_ptr().add((blk * 8 + 6) * 64) as *const __m512i);
+            let va7 = _mm512_loadu_si512(pq_va.as_ptr().add((blk * 8 + 7) * 64) as *const __m512i);
 
-                let va_full = va_fulls[sb];
+            // Pre-compute sum_x = pq_sum_x * scale_x (original x sum per sb)
+            let sx0 = pq_sum_x[blk * 8 + 0] as f32 * scale_x;
+            let sx1 = pq_sum_x[blk * 8 + 1] as f32 * scale_x;
+            let sx2 = pq_sum_x[blk * 8 + 2] as f32 * scale_x;
+            let sx3 = pq_sum_x[blk * 8 + 3] as f32 * scale_x;
+            let sx4 = pq_sum_x[blk * 8 + 4] as f32 * scale_x;
+            let sx5 = pq_sum_x[blk * 8 + 5] as f32 * scale_x;
+            let sx6 = pq_sum_x[blk * 8 + 6] as f32 * scale_x;
+            let sx7 = pq_sum_x[blk * 8 + 7] as f32 * scale_x;
 
-                let packed = _mm_loadu_si128(qs.add(sb * 16) as *const __m128i);
-                let lo_nib = _mm_and_si128(packed, mask_nibble);
-                let hi_nib = _mm_and_si128(_mm_srli_epi16(packed, 4), mask_nibble);
-                let lo_i8 = _mm_sub_epi8(lo_nib, eight);
-                let hi_i8 = _mm_sub_epi8(hi_nib, eight);
-                let w_256 = _mm256_set_m128i(hi_i8, lo_i8);
-                let w_512 = _mm512_inserti64x4(_mm512_castsi256_si512(w_256), w_256, 1);
-                let vw_u8 = _mm512_xor_si512(w_512, xor_mask);
-                quire = _mm512_dpbusd_epi32(quire, vw_u8, va_full);
+            let s0 = d * (scales[0] & 0x3F) as f32; let m0 = dmin * (mins[0] & 0x3F) as f32;
+            let s1 = d * (scales[1] & 0x3F) as f32; let m1 = dmin * (mins[1] & 0x3F) as f32;
+            let s2 = d * (scales[2] & 0x3F) as f32; let m2 = dmin * (mins[2] & 0x3F) as f32;
+            let s3 = d * (scales[3] & 0x3F) as f32; let m3 = dmin * (mins[3] & 0x3F) as f32;
+            let s4 = d * (scales[4] & 0x3F) as f32; let m4 = dmin * (mins[4] & 0x3F) as f32;
+            let s5 = d * (scales[5] & 0x3F) as f32; let m5 = dmin * (mins[5] & 0x3F) as f32;
+            let s6 = d * (scales[6] & 0x3F) as f32; let m6 = dmin * (mins[6] & 0x3F) as f32;
+            let s7 = d * (scales[7] & 0x3F) as f32; let m7 = dmin * (mins[7] & 0x3F) as f32;
+
+            total_dc += m0 * sx0 + (128.0 + 8.0) * sx0 * s0;
+            total_dc += m1 * sx1 + (128.0 + 8.0) * sx1 * s1;
+            total_dc += m2 * sx2 + (128.0 + 8.0) * sx2 * s2;
+            total_dc += m3 * sx3 + (128.0 + 8.0) * sx3 * s3;
+            total_dc += m4 * sx4 + (128.0 + 8.0) * sx4 * s4;
+            total_dc += m5 * sx5 + (128.0 + 8.0) * sx5 * s5;
+            total_dc += m6 * sx6 + (128.0 + 8.0) * sx6 * s6;
+            total_dc += m7 * sx7 + (128.0 + 8.0) * sx7 * s7;
+
+            // VNNI accumulation (unrolled, accumulate into single quire)
+            macro_rules! vnni_sb {
+                ($va:expr, $sq:expr) => {
+                    let packed = _mm_loadu_si128(qs.add($sq) as *const __m128i);
+                    let lo_nib = _mm_and_si128(packed, mask_nibble);
+                    let hi_nib = _mm_and_si128(_mm_srli_epi16(packed, 4), mask_nibble);
+                    let lo_i8 = _mm_sub_epi8(lo_nib, eight);
+                    let hi_i8 = _mm_sub_epi8(hi_nib, eight);
+                    let w_256 = _mm256_set_m128i(hi_i8, lo_i8);
+                    let w_512 = _mm512_inserti64x4(_mm512_castsi256_si512(w_256), w_256, 1);
+                    quire = _mm512_dpbusd_epi32(quire, _mm512_xor_si512(w_512, xor_mask), $va);
+                }
             }
 
-            let lo = _mm512_castsi512_si256(quire);
-            let hi = std::mem::transmute(_mm512_extracti64x4_epi64(quire, 1));
-            let s256 = _mm256_add_epi32(lo, hi);
-            let lo128 = _mm256_castsi256_si128(s256);
-            let hi128 = _mm256_extracti128_si256(s256, 1);
-            let s128 = _mm_add_epi32(lo128, hi128);
-            let s64 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
-            let s32 = _mm_add_epi32(s64, _mm_srli_si128(s64, 4));
-            let quire_scalar = _mm_cvtsi128_si32(s32);
-
-            out[row] += quire_scalar as f32 * scale_x - dot_corr;
-            row += 1;
+            vnni_sb!(va0, 0);   vnni_sb!(va1, 16);
+            vnni_sb!(va2, 32);  vnni_sb!(va3, 48);
+            vnni_sb!(va4, 64);  vnni_sb!(va5, 80);
+            vnni_sb!(va6, 96);  vnni_sb!(va7, 112);
         }
+
+        // Single collapse for entire row
+        let lo = _mm512_castsi512_si256(quire);
+        let hi = std::mem::transmute(_mm512_extracti64x4_epi64(quire, 1));
+        let s256 = _mm256_add_epi32(lo, hi);
+        let lo128 = _mm256_castsi256_si128(s256);
+        let hi128 = _mm256_extracti128_si256(s256, 1);
+        let s128 = _mm_add_epi32(lo128, hi128);
+        let s64 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
+        let s32 = _mm_add_epi32(s64, _mm_srli_si128(s64, 4));
+        out[row] += _mm_cvtsi128_si32(s32) as f32 * scale_x - total_dc;
     }
 }
 
@@ -555,6 +484,55 @@ pub fn fused_gemv_q4k_batched(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx512vl")]
+unsafe fn pre_quant_vnni(x: &[f32], n_blocks: usize) -> (f32, Vec<u8>, Vec<i32>) {
+    let n_x = n_blocks * Q4K_BLOCK_SIZE;
+
+    let mut x_i8 = vec![0i8; n_x];
+    let mut pq_va = vec![0u8; n_blocks * 8 * 64];
+    let mut pq_sum_x = vec![0i32; n_blocks * 8];
+
+    let mut max_abs = _mm512_setzero_ps();
+    let abs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFF_FFFF));
+    let mut j = 0;
+    while j + 16 <= n_x {
+        let v = _mm512_loadu_ps(x.as_ptr().add(j));
+        max_abs = _mm512_max_ps(max_abs, _mm512_and_ps(v, abs_mask));
+        j += 16;
+    }
+    let mut buf16 = [0.0f32; 16];
+    _mm512_storeu_ps(buf16.as_mut_ptr(), max_abs);
+    let global_max = buf16.iter().cloned().fold(0.0f32, f32::max);
+    let inv_scale_x = if global_max > 1e-6 { 127.0 / global_max } else { 0.0 };
+    let scale_x     = if global_max > 1e-6 { global_max / 127.0 } else { 1.0 };
+
+    j = 0;
+    while j + 16 <= n_x {
+        let vx  = _mm512_loadu_ps(x.as_ptr().add(j));
+        let vi  = _mm512_cvtps_epi32(_mm512_mul_ps(vx, _mm512_set1_ps(inv_scale_x)));
+        let vi8 = _mm512_cvtepi32_epi8(vi);
+        _mm_storeu_si128(x_i8.as_mut_ptr().add(j) as *mut __m128i, vi8);
+        j += 16;
+    }
+
+    for blk in 0..n_blocks {
+        for sb in 0..8 {
+            let sb_off = blk * Q4K_BLOCK_SIZE + sb * 32;
+            let mut sum = 0i32;
+            for k in 0..32 { sum += x_i8[sb_off + k] as i32; }
+            pq_sum_x[blk * 8 + sb] = sum;
+
+            let va_lo = _mm256_loadu_si256(x_i8.as_ptr().add(sb_off) as *const __m256i);
+            let va_hi = _mm256_loadu_si256(x_i8.as_ptr().add(sb_off + 16) as *const __m256i);
+            let va = _mm512_inserti64x4(_mm512_castsi256_si512(va_lo), va_hi, 1);
+            _mm512_storeu_si512(pq_va.as_mut_ptr().add((blk * 8 + sb) * 64) as *mut __m512i, va);
+        }
+    }
+
+    (scale_x, pq_va, pq_sum_x)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx512vl")]
 unsafe fn batched_vnni(
     w_raw: &[u8],
     x_ptrs: &[*const f32],
@@ -564,13 +542,139 @@ unsafe fn batched_vnni(
     n_blocks: usize,
     batch_size: usize,
 ) {
-    // Per-token loop calling fused_gemv_q4k_vnni for each token.
-    // Weight-sharing optimization disabled due to compiler sensitivity;
-    // AVX2 and scalar batched paths do share weights correctly.
+    if batch_size == 0 { return; }
+
+    let xor_mask = _mm512_set1_epi8(-128i8);
+    let mask_nibble = _mm_set1_epi8(0x0F);
+    let eight = _mm_set1_epi8(8i8);
+
+    // Phase 1: Pre-quantize ALL tokens upfront
+    let mut per_scale = Vec::with_capacity(batch_size);
+    let mut per_pq_va = Vec::with_capacity(batch_size);
+    let mut per_sum_x = Vec::with_capacity(batch_size);
     for t in 0..batch_size {
-        let x_slice  = std::slice::from_raw_parts(x_ptrs[t], n_cols);
-        let out_slice = std::slice::from_raw_parts_mut(out_ptrs[t], n_rows);
-        fused_gemv_q4k_vnni(w_raw, x_slice, out_slice, n_rows, n_cols, n_blocks);
+        let x = std::slice::from_raw_parts(x_ptrs[t], n_cols);
+        let (s, va, sx) = pre_quant_vnni(x, n_blocks);
+        per_scale.push(s);
+        per_pq_va.push(va);
+        per_sum_x.push(sx);
+    }
+
+    // Zero all outputs
+    for t in 0..batch_size {
+        let out = std::slice::from_raw_parts_mut(out_ptrs[t], n_rows);
+        out.fill(0.0);
+    }
+
+    let row_stride = n_blocks * Q4K_BLOCK_BYTES;
+
+    // Phase 2: Column-first (block-outer) with weight sharing
+    for blk in 0..n_blocks {
+        for row in 0..n_rows {
+            let base = row * row_stride + blk * Q4K_BLOCK_BYTES;
+            let d    = f16::from_le_bytes([w_raw[base],     w_raw[base + 1]]).to_f32();
+            let dmin = f16::from_le_bytes([w_raw[base + 2], w_raw[base + 3]]).to_f32();
+            let sc   = &w_raw[base + 4..base + 16];
+            let qs   = w_raw.as_ptr().add(base + 16);
+            let (scales, mins) = unpack_scales_q4k(sc);
+
+            let s0 = d * (scales[0] & 0x3F) as f32; let m0 = dmin * (mins[0] & 0x3F) as f32;
+            let s1 = d * (scales[1] & 0x3F) as f32; let m1 = dmin * (mins[1] & 0x3F) as f32;
+            let s2 = d * (scales[2] & 0x3F) as f32; let m2 = dmin * (mins[2] & 0x3F) as f32;
+            let s3 = d * (scales[3] & 0x3F) as f32; let m3 = dmin * (mins[3] & 0x3F) as f32;
+            let s4 = d * (scales[4] & 0x3F) as f32; let m4 = dmin * (mins[4] & 0x3F) as f32;
+            let s5 = d * (scales[5] & 0x3F) as f32; let m5 = dmin * (mins[5] & 0x3F) as f32;
+            let s6 = d * (scales[6] & 0x3F) as f32; let m6 = dmin * (mins[6] & 0x3F) as f32;
+            let s7 = d * (scales[7] & 0x3F) as f32; let m7 = dmin * (mins[7] & 0x3F) as f32;
+
+            // Pre-load all 8 sub-block nibble data (shared across tokens)
+            let p0 = _mm_loadu_si128(qs.add(0) as *const __m128i);
+            let p1 = _mm_loadu_si128(qs.add(16) as *const __m128i);
+            let p2 = _mm_loadu_si128(qs.add(32) as *const __m128i);
+            let p3 = _mm_loadu_si128(qs.add(48) as *const __m128i);
+            let p4 = _mm_loadu_si128(qs.add(64) as *const __m128i);
+            let p5 = _mm_loadu_si128(qs.add(80) as *const __m128i);
+            let p6 = _mm_loadu_si128(qs.add(96) as *const __m128i);
+            let p7 = _mm_loadu_si128(qs.add(112) as *const __m128i);
+
+            // Pre-expand nibbles to signed i8 (shared across tokens)
+            macro_rules! expand_nibbles {
+                ($packed:expr) => {{
+                    let lo = _mm_and_si128($packed, mask_nibble);
+                    let hi = _mm_and_si128(_mm_srli_epi16($packed, 4), mask_nibble);
+                    let lo8 = _mm_sub_epi8(lo, eight);
+                    let hi8 = _mm_sub_epi8(hi, eight);
+                    let w256 = _mm256_set_m128i(hi8, lo8);
+                    let w512 = _mm512_inserti64x4(_mm512_castsi256_si512(w256), w256, 1);
+                    _mm512_xor_si512(w512, xor_mask)
+                }}
+            }
+
+            let w0 = expand_nibbles!(p0);
+            let w1 = expand_nibbles!(p1);
+            let w2 = expand_nibbles!(p2);
+            let w3 = expand_nibbles!(p3);
+            let w4 = expand_nibbles!(p4);
+            let w5 = expand_nibbles!(p5);
+            let w6 = expand_nibbles!(p6);
+            let w7 = expand_nibbles!(p7);
+
+            for t in 0..batch_size {
+                let va_base = per_pq_va[t].as_ptr();
+                let sx_base = &per_sum_x[t];
+                let scale_x = per_scale[t];
+
+                let va0 = _mm512_loadu_si512(va_base.add((blk * 8) * 64) as *const __m512i);
+                let va1 = _mm512_loadu_si512(va_base.add((blk * 8 + 1) * 64) as *const __m512i);
+                let va2 = _mm512_loadu_si512(va_base.add((blk * 8 + 2) * 64) as *const __m512i);
+                let va3 = _mm512_loadu_si512(va_base.add((blk * 8 + 3) * 64) as *const __m512i);
+                let va4 = _mm512_loadu_si512(va_base.add((blk * 8 + 4) * 64) as *const __m512i);
+                let va5 = _mm512_loadu_si512(va_base.add((blk * 8 + 5) * 64) as *const __m512i);
+                let va6 = _mm512_loadu_si512(va_base.add((blk * 8 + 6) * 64) as *const __m512i);
+                let va7 = _mm512_loadu_si512(va_base.add((blk * 8 + 7) * 64) as *const __m512i);
+
+                let sx0 = sx_base[blk * 8 + 0] as f32 * scale_x;
+                let sx1 = sx_base[blk * 8 + 1] as f32 * scale_x;
+                let sx2 = sx_base[blk * 8 + 2] as f32 * scale_x;
+                let sx3 = sx_base[blk * 8 + 3] as f32 * scale_x;
+                let sx4 = sx_base[blk * 8 + 4] as f32 * scale_x;
+                let sx5 = sx_base[blk * 8 + 5] as f32 * scale_x;
+                let sx6 = sx_base[blk * 8 + 6] as f32 * scale_x;
+                let sx7 = sx_base[blk * 8 + 7] as f32 * scale_x;
+
+                let total_dc = m0 * sx0 + (128.0 + 8.0) * sx0 * s0
+                             + m1 * sx1 + (128.0 + 8.0) * sx1 * s1
+                             + m2 * sx2 + (128.0 + 8.0) * sx2 * s2
+                             + m3 * sx3 + (128.0 + 8.0) * sx3 * s3
+                             + m4 * sx4 + (128.0 + 8.0) * sx4 * s4
+                             + m5 * sx5 + (128.0 + 8.0) * sx5 * s5
+                             + m6 * sx6 + (128.0 + 8.0) * sx6 * s6
+                             + m7 * sx7 + (128.0 + 8.0) * sx7 * s7;
+
+                let mut quire = _mm512_setzero_si512();
+                quire = _mm512_dpbusd_epi32(quire, w0, va0);
+                quire = _mm512_dpbusd_epi32(quire, w1, va1);
+                quire = _mm512_dpbusd_epi32(quire, w2, va2);
+                quire = _mm512_dpbusd_epi32(quire, w3, va3);
+                quire = _mm512_dpbusd_epi32(quire, w4, va4);
+                quire = _mm512_dpbusd_epi32(quire, w5, va5);
+                quire = _mm512_dpbusd_epi32(quire, w6, va6);
+                quire = _mm512_dpbusd_epi32(quire, w7, va7);
+
+                // Collapse quire to f32 partial sum
+                let lo = _mm512_castsi512_si256(quire);
+                let hi = std::mem::transmute(_mm512_extracti64x4_epi64(quire, 1));
+                let s256 = _mm256_add_epi32(lo, hi);
+                let lo128 = _mm256_castsi256_si128(s256);
+                let hi128 = _mm256_extracti128_si256(s256, 1);
+                let s128 = _mm_add_epi32(lo128, hi128);
+                let s64 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
+                let s32 = _mm_add_epi32(s64, _mm_srli_si128(s64, 4));
+                let partial = _mm_cvtsi128_si32(s32) as f32 * scale_x - total_dc;
+
+                *out_ptrs[t].add(row) += partial;
+            }
+        }
     }
 }
 

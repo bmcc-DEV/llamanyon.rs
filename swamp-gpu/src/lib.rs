@@ -1,718 +1,676 @@
-// swamp-gpu/src/lib.rs
-// Rust bridge para GPU acceleration via CUDA C shared library
-// Carrega libswamp_gpu.so em runtime com libloading
+pub mod vulkan;
+pub mod compute_graph;
+pub mod shaders;
+pub mod mojo;
 
-use libloading::{Library, Symbol};
-use std::sync::OnceLock;
-use thiserror::Error;
-use tracing::info;
+use std::sync::Arc;
+use ash::vk;
+use vk::Handle;
 
-impl From<libloading::Error> for GpuError {
-    fn from(e: libloading::Error) -> Self {
-        GpuError::Symbol(format!("{:?}", e))
-    }
+pub use vulkan::VkBackend;
+pub use compute_graph::{ComputeGraph, ComputeNode, ComputeNodeOp};
+pub use shaders::{ShaderCache, ShaderType};
+pub use mojo::{MojoKernel, get_mojo};
+
+use swamp_tensors::hma::{DeviceAllocator, Allocation, MemoryLocation};
+
+// ===========================================================================
+// New Architecture Types
+// ===========================================================================
+
+pub struct GpuDevice {
+    pub backend: Arc<VkBackend>,
+    pub shader_cache: std::sync::Mutex<ShaderCache>,
+    pub compute_graph: std::sync::Mutex<ComputeGraph>,
+    pub enabled: bool,
 }
 
-#[derive(Error, Debug, Clone)]
-pub enum GpuError {
-    #[error("CUDA/GPU not available: {0}")]
-    NotAvailable(String),
-    #[error("Library load failed: {0}")]
-    LibLoad(String),
-    #[error("Symbol lookup failed: {0}")]
-    Symbol(String),
-    #[error("GPU kernel returned error code {0}")]
-    KernelError(i32),
-}
-
-pub type Result<T> = std::result::Result<T, GpuError>;
-
-static GPU_LIB: OnceLock<Result<Library>> = OnceLock::new();
-
-fn try_lib() -> Result<&'static Library> {
-    match GPU_LIB.get_or_init(|| {
-        let paths = [
-            "libswamp_gpu.so",
-            "./swamp-gpu/libswamp_gpu.so",
-            "../swamp-gpu/libswamp_gpu.so",
-            "/media/bruno/Bruno/Swamp 5.0/llamanyon/swamp-gpu/libswamp_gpu.so",
-        ];
-        for path in &paths {
-            match unsafe { Library::new(path) } {
-                Ok(lib) => {
-                    info!("GPU library loaded from: {}", path);
-                    return Ok(lib);
+impl GpuDevice {
+    pub fn new() -> Self {
+        let backend = Arc::new(VkBackend::new());
+        let enabled = backend.enabled;
+        if enabled {
+            let sc = ShaderCache::new(&backend);
+            match ComputeGraph::new(&backend) {
+                Ok(cg) => Self {
+                    backend,
+                    shader_cache: std::sync::Mutex::new(sc),
+                    compute_graph: std::sync::Mutex::new(cg),
+                    enabled,
+                },
+                Err(e) => {
+                    tracing::warn!("Failed to create compute graph: {}", e);
+                    Self::disabled()
                 }
-                Err(_) => continue,
             }
+        } else {
+            Self::disabled()
         }
-        Err(GpuError::LibLoad("libswamp_gpu.so not found".into()))
-    }) {
-        Ok(lib) => Ok(lib),
-        Err(e) => Err(e.clone()),
+    }
+
+    fn disabled() -> Self {
+        let backend = Arc::new(VkBackend::new());
+        let sc = ShaderCache::new(&backend);
+        let cg = ComputeGraph::new(&backend).unwrap_or_else(|_| {
+            std::process::abort();
+        });
+        Self {
+            backend,
+            shader_cache: std::sync::Mutex::new(sc),
+            compute_graph: std::sync::Mutex::new(cg),
+            enabled: false,
+        }
+    }
+
+    pub fn is_operational(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn submit_graph(&self) -> bool {
+        if !self.enabled { return false; }
+        let mut cg = self.compute_graph.lock().unwrap();
+        cg.submit().is_ok()
+    }
+
+    pub fn wait_graph(&self) -> bool {
+        if !self.enabled { return false; }
+        let cg = self.compute_graph.lock().unwrap();
+        cg.wait().is_ok()
+    }
+
+    pub fn allocate_device_local(&self, size: u64) -> Option<(vk::Buffer, vk::DeviceMemory)> {
+        if !self.enabled { return None; }
+        self.backend.allocate_buffer(
+            size,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ).ok()
+    }
+
+    pub fn allocate_unified(&self, size: u64) -> Option<(vk::Buffer, vk::DeviceMemory)> {
+        if !self.enabled { return None; }
+        self.backend.allocate_buffer(
+            size,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_CACHED,
+        ).ok()
     }
 }
 
-/// Check if GPU acceleration is available
+impl DeviceAllocator for GpuDevice {
+    fn allocate_device(&self, size: usize) -> Option<Allocation> {
+        let (buffer, memory) = self.allocate_device_local(size as u64)?;
+        let ptr = if memory != vk::DeviceMemory::null() && size > 0 {
+            unsafe {
+                self.backend.device.map_memory(
+                    memory,
+                    0,
+                    size as u64,
+                    vk::MemoryMapFlags::empty(),
+                ).ok()?
+            }
+        } else {
+            std::ptr::null_mut()
+        };
+        Some(Allocation {
+            ptr: ptr as *mut u8,
+            size,
+            location: MemoryLocation::DeviceLocal,
+            device_handle: Some(buffer.as_raw()),
+        })
+    }
+
+    fn allocate_unified(&self, size: usize) -> Option<Allocation> {
+        let (buffer, memory) = self.allocate_unified(size as u64)?;
+        let ptr = unsafe {
+            self.backend.device.map_memory(
+                memory,
+                0,
+                size as u64,
+                vk::MemoryMapFlags::empty(),
+            ).ok()?
+        };
+        Some(Allocation {
+            ptr: ptr as *mut u8,
+            size,
+            location: MemoryLocation::UnifiedMapped,
+            device_handle: Some(buffer.as_raw()),
+        })
+    }
+
+    fn free(&self, alloc: &Allocation) {
+        if let Some(handle) = alloc.device_handle {
+            let buffer = unsafe { vk::Buffer::from_raw(handle) };
+            unsafe { self.backend.device.destroy_buffer(buffer, None); }
+        }
+    }
+
+    fn upload(&self, dst: &Allocation, src: &[u8]) {
+        if !self.enabled || dst.ptr.is_null() { return; }
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst.ptr, src.len().min(dst.size)); }
+    }
+
+    fn download(&self, dst: &mut [u8], src: &Allocation) {
+        if !self.enabled || src.ptr.is_null() { return; }
+        unsafe { std::ptr::copy_nonoverlapping(src.ptr, dst.as_mut_ptr(), dst.len().min(src.size)); }
+    }
+}
+
 pub fn gpu_available() -> bool {
-    try_lib().is_ok()
+    let backend = VkBackend::new();
+    backend.enabled
 }
 
-/// Initialize GPU context (call once at startup)
-pub fn gpu_init() -> Result<()> {
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn() -> i32> = unsafe { lib.get(b"gpu_init")? };
-    let ret = unsafe { func() };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
+// ===========================================================================
+// GpuBuf: thin wrapper around a GPU buffer
+// ===========================================================================
+
+#[derive(Clone, Copy)]
+pub struct GpuBuf {
+    pub buffer: vk::Buffer,
+    pub memory: vk::DeviceMemory,
+    pub size: u64,
+    pub mapped: *mut u8,
+}
+
+unsafe impl Send for GpuBuf {}
+unsafe impl Sync for GpuBuf {}
+
+impl GpuBuf {
+    pub fn null() -> Self {
+        Self {
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            size: 0,
+            mapped: std::ptr::null_mut(),
+        }
     }
-    info!("GPU initialized (GTX 1650 Mobile)");
-    Ok(())
-}
 
-/// Fused GPU attention: QK^T + softmax + weighted sum of V
-/// All pointers are host (CPU) memory — copies happen internally.
-pub fn gpu_attention_forward(
-    q: &[f32],
-    k_cache: &[f32],
-    v_cache: &[f32],
-    output: &mut [f32],
-    n_heads: usize,
-    n_kv_heads: usize,
-    seq_len: usize,
-    head_dim: usize,
-) -> Result<()> {
-    let lib = try_lib()?;
-
-    assert_eq!(q.len(), n_heads * head_dim, "Q size mismatch");
-    assert_eq!(k_cache.len(), n_kv_heads * seq_len * head_dim, "K cache size mismatch");
-    assert_eq!(v_cache.len(), n_kv_heads * seq_len * head_dim, "V cache size mismatch");
-    assert_eq!(output.len(), n_heads * head_dim, "output size mismatch");
-
-    let func: Symbol<
-        unsafe extern "C" fn(*const f32, *const f32, *const f32, *mut f32, i32, i32, i32, i32) -> i32,
-    > = unsafe { lib.get(b"gpu_attention_forward")? };
-
-    let ret = unsafe {
-        func(
-            q.as_ptr(), k_cache.as_ptr(), v_cache.as_ptr(),
-            output.as_mut_ptr(),
-            n_heads as i32, n_kv_heads as i32, seq_len as i32, head_dim as i32,
-        )
-    };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
+    pub fn is_null(&self) -> bool {
+        self.buffer == vk::Buffer::null()
     }
-    Ok(())
-}
 
-/// Allocate device memory (raw bytes)
-pub unsafe fn gpu_alloc(bytes: usize) -> Result<*mut std::ffi::c_void> {
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(usize) -> *mut std::ffi::c_void> =
-        unsafe { lib.get(b"gpu_alloc")? };
-    let ptr = unsafe { func(bytes) };
-    if ptr.is_null() {
-        return Err(GpuError::KernelError(-1));
+    pub fn as_slice_f32(&self) -> Option<&[f32]> {
+        if self.mapped.is_null() { return None; }
+        Some(unsafe { std::slice::from_raw_parts(self.mapped as *const f32, self.size as usize / 4) })
     }
-    Ok(ptr)
-}
 
-/// Allocate persistent K/V buffer on GPU: [n_kv_heads, max_seq_len, head_dim]
-pub fn gpu_alloc_kv_buffer(n_kv_heads: usize, max_seq_len: usize, head_dim: usize) -> Result<*mut f32> {
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(i32, i32, i32, *mut usize) -> *mut f32> =
-        unsafe { lib.get(b"gpu_alloc_kv_buffer")? };
-    let mut out_bytes: usize = 0;
-    let ptr = unsafe { func(n_kv_heads as i32, max_seq_len as i32, head_dim as i32, &mut out_bytes) };
-    if ptr.is_null() {
-        return Err(GpuError::KernelError(-1));
+    pub fn as_slice_f32_mut(&self) -> Option<&mut [f32]> {
+        if self.mapped.is_null() { return None; }
+        Some(unsafe { std::slice::from_raw_parts_mut(self.mapped as *mut f32, self.size as usize / 4) })
     }
-    info!("GPU KV buffer allocated: {} MB", out_bytes as f64 / 1e6);
-    Ok(ptr)
-}
 
-/// Free GPU K/V buffer
-pub fn gpu_free(ptr: *mut std::ffi::c_void) -> Result<()> {
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-        unsafe { lib.get(b"gpu_free")? };
-    unsafe { func(ptr) };
-    Ok(())
-}
-
-/// Copy one (kv_head, pos) entry from host to GPU K/V buffer
-pub fn gpu_copy_kv_to_buffer(
-    d_buf: *mut f32,
-    h_src: &[f32],
-    kv_head: usize,
-    pos: usize,
-    n_kv_heads: usize,
-    max_seq_len: usize,
-    head_dim: usize,
-) -> Result<()> {
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*mut f32, *const f32, i32, i32, i32, i32, i32) -> i32> =
-        unsafe { lib.get(b"gpu_copy_kv_to_buffer")? };
-    let ret = unsafe {
-        func(d_buf, h_src.as_ptr(), kv_head as i32, pos as i32,
-             n_kv_heads as i32, max_seq_len as i32, head_dim as i32)
-    };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
+    pub fn copy_from_host(&self, src: &[u8]) {
+        if self.mapped.is_null() || src.is_empty() { return; }
+        let len = src.len().min(self.size as usize);
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.mapped, len); }
     }
-    Ok(())
-}
 
-/// Copy entire layer position (all kv_heads) from host to GPU buffer in one call
-pub fn gpu_copy_kv_layer(
-    d_buf: *mut f32,
-    h_src: &[f32],
-    pos: usize,
-    n_kv_heads: usize,
-    max_seq_len: usize,
-    head_dim: usize,
-) -> Result<()> {
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*mut f32, *const f32, i32, i32, i32, i32) -> i32> =
-        unsafe { lib.get(b"gpu_copy_kv_layer")? };
-    let ret = unsafe {
-        func(d_buf, h_src.as_ptr(), pos as i32, n_kv_heads as i32, max_seq_len as i32, head_dim as i32)
-    };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
+    pub fn copy_to_host(&self, dst: &mut [u8]) {
+        if self.mapped.is_null() || dst.is_empty() { return; }
+        let len = dst.len().min(self.size as usize);
+        unsafe { std::ptr::copy_nonoverlapping(self.mapped, dst.as_mut_ptr(), len); }
     }
-    Ok(())
 }
 
-/// Device-pointer attention: K/V already on GPU, Q copied fresh per layer
-/// kv_stride: striding between kv_head blocks (seq_len for contiguous, max_seq_len for persistent)
-pub fn gpu_attention_device(
-    d_q: *const f32,
-    d_k: *const f32,
-    d_v: *const f32,
-    d_out: *mut f32,
-    n_heads: usize,
-    n_kv_heads: usize,
-    seq_len: usize,
-    head_dim: usize,
-    kv_stride: usize,
-) -> Result<()> {
-    let lib = try_lib()?;
-    let func: Symbol<
-        unsafe extern "C" fn(*const f32, *const f32, *const f32, *mut f32, i32, i32, i32, i32, i32) -> i32,
-    > = unsafe { lib.get(b"gpu_attention_device")? };
-    let ret = unsafe {
-        func(d_q, d_k, d_v, d_out, n_heads as i32, n_kv_heads as i32, seq_len as i32, head_dim as i32, kv_stride as i32)
-    };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
+// ===========================================================================
+// LayerWeightSet: all weight buffers for all layers on device
+// ===========================================================================
+
+pub struct LayerWeights {
+    pub q: Vec<GpuBuf>,
+    pub k: Vec<GpuBuf>,
+    pub v: Vec<GpuBuf>,
+    pub o: Vec<GpuBuf>,
+    pub gate: Vec<GpuBuf>,
+    pub up: Vec<GpuBuf>,
+    pub down: Vec<GpuBuf>,
+    pub attn_norm: Vec<GpuBuf>,
+    pub ffn_norm: Vec<GpuBuf>,
+}
+
+impl LayerWeights {
+    pub fn new(num_layers: usize) -> Self {
+        Self {
+            q: vec![GpuBuf::null(); num_layers],
+            k: vec![GpuBuf::null(); num_layers],
+            v: vec![GpuBuf::null(); num_layers],
+            o: vec![GpuBuf::null(); num_layers],
+            gate: vec![GpuBuf::null(); num_layers],
+            up: vec![GpuBuf::null(); num_layers],
+            down: vec![GpuBuf::null(); num_layers],
+            attn_norm: vec![GpuBuf::null(); num_layers],
+            ffn_norm: vec![GpuBuf::null(); num_layers],
+        }
     }
-    Ok(())
 }
 
-/// Allocate temp Q buffer on GPU and copy from host
-pub fn gpu_alloc_and_copy_q(h_q: &[f32], n_heads: usize, head_dim: usize) -> Result<*mut f32> {
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*const f32, i32, i32) -> *mut f32> =
-        unsafe { lib.get(b"gpu_alloc_and_copy_q")? };
-    let ptr = unsafe { func(h_q.as_ptr(), n_heads as i32, head_dim as i32) };
-    if ptr.is_null() {
-        return Err(GpuError::KernelError(-1));
+// ===========================================================================
+// GpuKVCache: ring buffer for key/value cache on device
+// ===========================================================================
+
+pub struct GpuKVCache {
+    pub k_buf: GpuBuf,
+    pub v_buf: GpuBuf,
+    pub n_kv_heads: usize,
+    pub window_size: usize,
+    pub head_dim: usize,
+}
+
+impl GpuKVCache {
+    pub fn new(device: &GpuDevice, n_kv_heads: usize, window_size: usize, head_dim: usize) -> Option<Self> {
+        if !device.enabled { return None; }
+        let elem_size = 2u64; // FP16
+        let buf_size = n_kv_heads as u64 * window_size as u64 * head_dim as u64 * elem_size;
+        let (k_buf, k_mem) = device.backend.allocate_buffer(
+            buf_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ).ok()?;
+        let (v_buf, v_mem) = device.backend.allocate_buffer(
+            buf_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ).ok()?;
+        Some(Self {
+            k_buf: GpuBuf { buffer: k_buf, memory: k_mem, size: buf_size, mapped: std::ptr::null_mut() },
+            v_buf: GpuBuf { buffer: v_buf, memory: v_mem, size: buf_size, mapped: std::ptr::null_mut() },
+            n_kv_heads,
+            window_size,
+            head_dim,
+        })
     }
-    Ok(ptr)
 }
 
-/// Copy attention output from GPU to host
-pub fn gpu_copy_output_to_host(h_out: &mut [f32], d_out: *const f32, n_heads: usize, head_dim: usize) -> Result<()> {
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*mut f32, *const f32, i32, i32) -> i32> =
-        unsafe { lib.get(b"gpu_copy_output_to_host")? };
-    let ret = unsafe { func(h_out.as_mut_ptr(), d_out, n_heads as i32, head_dim as i32) };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
+// ===========================================================================
+// ScratchBuffers: pre-allocated working buffers for compute graph
+// ===========================================================================
+
+pub struct ScratchBuffers {
+    pub d_x: GpuBuf,
+    pub d_x_norm: GpuBuf,
+    pub d_q: GpuBuf,
+    pub d_k: GpuBuf,
+    pub d_v: GpuBuf,
+    pub d_attn: GpuBuf,
+    pub d_gate: GpuBuf,
+    pub d_up: GpuBuf,
+    pub d_down: GpuBuf,
+    pub d_scores: GpuBuf,
+}
+
+impl ScratchBuffers {
+    pub fn new(device: &GpuDevice, embed_dim: usize, ffn_dim: usize, n_heads: usize, window_size: usize, head_dim: usize) -> Option<Self> {
+        if !device.enabled { return None; }
+        let alloc = |size: usize| -> Option<GpuBuf> {
+            let (buf, mem) = device.backend.allocate_buffer(
+                size as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            ).ok()?;
+            Some(GpuBuf { buffer: buf, memory: mem, size: size as u64, mapped: std::ptr::null_mut() })
+        };
+        let e = embed_dim * 4; // f32 bytes
+        let f = ffn_dim * 4;
+        let qkv = n_heads.max(1) * head_dim * 4;
+        let scores = n_heads * window_size * 4;
+        Some(Self {
+            d_x: alloc(e)?,
+            d_x_norm: alloc(e)?,
+            d_q: alloc(qkv)?,
+            d_k: alloc(qkv)?,
+            d_v: alloc(qkv)?,
+            d_attn: alloc(e)?,
+            d_gate: alloc(f)?,
+            d_up: alloc(f)?,
+            d_down: alloc(e)?,
+            d_scores: alloc(scores)?,
+        })
     }
-    Ok(())
 }
 
-/// Synchronize GPU device
-pub fn gpu_sync() -> Result<()> {
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn() -> i32> = unsafe { lib.get(b"gpu_sync")? };
-    let ret = unsafe { func() };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
+// ===========================================================================
+// StagingBuffer: host-visible coherent buffer for CPU↔GPU transfers
+// ===========================================================================
+
+pub struct StagingBuffer {
+    pub buf: GpuBuf,
+    pub device: vk::Buffer,
+    pub size: u64,
+}
+
+impl StagingBuffer {
+    pub fn new(device: &GpuDevice, size: u64) -> Option<Self> {
+        if !device.enabled { return None; }
+        let (buf, mem) = device.backend.allocate_buffer(
+            size,
+            vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ).ok()?;
+        let mapped = unsafe {
+            device.backend.device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty()).ok()?
+        };
+        Some(Self {
+            buf: GpuBuf { buffer: buf, memory: mem, size, mapped: mapped as *mut u8 },
+            device: buf,
+            size,
+        })
     }
-    Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// CUDA Stream API (for async/overlapped GPU execution)
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// GpuComputeContext: high-level GPU compute orchestrator
+// Wraps GpuDevice + ComputeGraph + pre-allocated buffers
+// Each method adds ops to the graph; call submit_and_wait() to execute
+// ===========================================================================
 
-/// Opaque handle to a CUDA stream
+pub struct GpuComputeContext {
+    pub device: Arc<GpuDevice>,
+    pub weights: LayerWeights,
+    pub kv_cache: Option<GpuKVCache>,
+    pub scratch: Option<ScratchBuffers>,
+    pub staging: Option<StagingBuffer>,
+    pub node_count: usize,
+    pub embed_dim: usize,
+    pub ffn_dim: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub window_size: usize,
+    pub enabled: bool,
+}
+
+unsafe impl Send for GpuComputeContext {}
+unsafe impl Sync for GpuComputeContext {}
+
+impl GpuComputeContext {
+    pub fn new(
+        device: &Arc<GpuDevice>,
+        embed_dim: usize,
+        ffn_dim: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        window_size: usize,
+        num_layers: usize,
+    ) -> Option<Self> {
+        if !device.enabled { return None; }
+        let scratch = ScratchBuffers::new(device, embed_dim, ffn_dim, n_heads, window_size, head_dim)?;
+        let staging = StagingBuffer::new(device, (embed_dim.max(ffn_dim) * 8) as u64)?;
+        let kv_cache = GpuKVCache::new(device, n_kv_heads, window_size, head_dim)?;
+        Some(Self {
+            device: device.clone(),
+            weights: LayerWeights::new(num_layers),
+            kv_cache: Some(kv_cache),
+            scratch: Some(scratch),
+            staging: Some(staging),
+            node_count: 0,
+            embed_dim,
+            ffn_dim,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            window_size,
+            enabled: true,
+        })
+    }
+
+    pub fn is_operational(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn upload_layer_weights(
+        &mut self,
+        layer: usize,
+        h_q: &[u8], h_k: &[u8], h_v: &[u8],
+        h_o: &[u8], h_gate: &[u8], h_up: &[u8], h_down: &[u8],
+        h_attn_norm: &[u8], h_ffn_norm: &[u8],
+    ) -> bool {
+        if !self.enabled { return false; }
+        let upload = |h: &[u8]| -> Option<GpuBuf> {
+            let backend = &self.device.backend;
+            let size = h.len() as u64;
+            let (buf, mem) = backend.allocate_buffer(
+                size,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            ).ok()?;
+            let staging = StagingBuffer::new(&self.device, size)?;
+            staging.buf.copy_from_host(h);
+            let cmd_alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(backend.compute_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cbs = unsafe { backend.device.allocate_command_buffers(&cmd_alloc).ok()? };
+            let cb = cbs[0];
+            unsafe {
+                backend.device.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok()?;
+                let region = vk::BufferCopy::default().size(size).src_offset(0).dst_offset(0);
+                backend.device.cmd_copy_buffer(cb, staging.buf.buffer, buf, &[region]);
+                backend.device.end_command_buffer(cb).ok()?;
+            }
+            let fence = unsafe { backend.device.create_fence(&vk::FenceCreateInfo::default(), None).ok()? };
+            let cbs_arr = [cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs_arr);
+            let submits_arr = [submit];
+            unsafe { backend.device.queue_submit(backend._queue, &submits_arr, fence).ok()?; }
+            unsafe { backend.device.wait_for_fences(&[fence], true, u64::MAX).ok()?; }
+            unsafe { backend.device.destroy_fence(fence, None); }
+            Some(GpuBuf { buffer: buf, memory: mem, size, mapped: std::ptr::null_mut() })
+        };
+        let w = &mut self.weights;
+        w.q[layer] = match upload(h_q) { Some(x) => x, None => return false };
+        w.k[layer] = match upload(h_k) { Some(x) => x, None => return false };
+        w.v[layer] = match upload(h_v) { Some(x) => x, None => return false };
+        w.o[layer] = match upload(h_o) { Some(x) => x, None => return false };
+        w.gate[layer] = match upload(h_gate) { Some(x) => x, None => return false };
+        w.up[layer] = match upload(h_up) { Some(x) => x, None => return false };
+        w.down[layer] = match upload(h_down) { Some(x) => x, None => return false };
+        w.attn_norm[layer] = match upload(h_attn_norm) { Some(x) => x, None => return false };
+        w.ffn_norm[layer] = match upload(h_ffn_norm) { Some(x) => x, None => return false };
+        true
+    }
+
+    pub fn reset_graph(&mut self) {
+        self.node_count = 0;
+    }
+
+    pub fn submit_and_wait(&mut self) -> bool {
+        if !self.enabled || self.node_count == 0 { return false; }
+        let mut cg = self.device.compute_graph.lock().unwrap();
+        let pool = self.device.backend.compute_pool;
+        let _ = cg.build(pool);
+        let _ = cg.submit();
+        let _ = cg.wait();
+        cg.reset();
+        self.node_count = 0;
+        true
+    }
+
+    /// Add a GEMV Q4_K node to the compute graph. Returns node index.
+    pub fn add_gemv_q4k_node(
+        &mut self, w: vk::Buffer, input: vk::Buffer, output: vk::Buffer,
+        n_rows: u32, n_blocks: u32, deps: Vec<usize>,
+    ) -> usize {
+        let mut cg = self.device.compute_graph.lock().unwrap();
+        let idx = cg.add_node(crate::compute_graph::ComputeNodeOp::GEMVQ4K {
+            d_w: w, d_x: input, d_out: output,
+            n_rows, n_blocks,
+        }, deps);
+        self.node_count += 1;
+        idx
+    }
+
+    /// Add an Attention node to the compute graph. Returns node index.
+    pub fn add_attention_node(
+        &mut self, d_q: vk::Buffer, d_k: vk::Buffer, d_v: vk::Buffer,
+        d_scores: vk::Buffer, d_out: vk::Buffer,
+        n_heads: u32, n_kv_heads: u32, seq_len: u32, head_dim: u32, kv_stride: u32,
+        deps: Vec<usize>,
+    ) -> usize {
+        let mut cg = self.device.compute_graph.lock().unwrap();
+        let idx = cg.add_node(crate::compute_graph::ComputeNodeOp::Attention {
+            d_q, d_k, d_v, d_scores, d_out,
+            n_heads, n_kv_heads, seq_len, head_dim, kv_stride,
+        }, deps);
+        self.node_count += 1;
+        idx
+    }
+
+    /// Add a memory barrier node. Returns node index.
+    pub fn add_barrier(&mut self, deps: Vec<usize>) -> usize {
+        let mut cg = self.device.compute_graph.lock().unwrap();
+        let idx = cg.add_node(crate::compute_graph::ComputeNodeOp::MemoryBarrier, deps);
+        self.node_count += 1;
+        idx
+    }
+
+    /// One-shot copy between buffers via staging (host-visible coherent)
+    pub fn copy_between(&self, src: vk::Buffer, dst: vk::Buffer, src_off: u64, dst_off: u64, size: u64) -> bool {
+        if !self.enabled { return false; }
+        let backend = &self.device.backend;
+        let pool = backend.compute_pool;
+        let cmd_alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cbs = match unsafe { backend.device.allocate_command_buffers(&cmd_alloc) } {
+            Ok(c) => c, Err(_) => return false,
+        };
+        let cb = cbs[0];
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        if unsafe { backend.device.begin_command_buffer(cb, &begin) }.is_err() { return false; }
+        let region = vk::BufferCopy::default()
+            .src_offset(src_off).dst_offset(dst_off).size(size);
+        unsafe { backend.device.cmd_copy_buffer(cb, src, dst, &[region]); }
+        if unsafe { backend.device.end_command_buffer(cb) }.is_err() { return false; }
+        let cbs_arr = [cb];
+        let submit = vk::SubmitInfo::default().command_buffers(&cbs_arr);
+        let submits_arr = [submit];
+        let fence = match unsafe { backend.device.create_fence(&vk::FenceCreateInfo::default(), None) } {
+            Ok(f) => f, Err(_) => return false,
+        };
+        let result = unsafe { backend.device.queue_submit(backend._queue, &submits_arr, fence) };
+        if result.is_err() { return false; }
+        let _ = unsafe { backend.device.wait_for_fences(&[fence], true, u64::MAX) };
+        unsafe { backend.device.destroy_fence(fence, None); }
+        true
+    }
+
+    pub fn upload_norm_weight(&mut self, layer: usize, is_attn: bool, h_bytes: &[u8]) -> bool {
+        if !self.enabled { return false; }
+        let backend = &self.device.backend;
+        let size = h_bytes.len() as u64;
+        let (buf, mem) = match backend.allocate_buffer(
+            size,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ) {
+            Ok(x) => x, Err(_) => return false,
+        };
+        let staging = match StagingBuffer::new(&self.device, size) { Some(s) => s, None => return false };
+        staging.buf.copy_from_host(h_bytes);
+        let gpu = GpuBuf { buffer: buf, memory: mem, size, mapped: std::ptr::null_mut() };
+        self.copy_between(staging.buf.buffer, buf, 0, 0, size);
+        if is_attn {
+            if layer < self.weights.attn_norm.len() { self.weights.attn_norm[layer] = gpu; }
+        } else {
+            if layer < self.weights.ffn_norm.len() { self.weights.ffn_norm[layer] = gpu; }
+        }
+        true
+    }
+}
+
+// ===========================================================================
+// Legacy CUDA Compatibility: stubs that always fall back to CPU
+// Kept so executor.rs and scheduler.rs compile without changes
+// ===========================================================================
+
 #[derive(Debug, Clone, Copy)]
-pub struct CudaStream(*mut std::ffi::c_void);
-
+pub struct CudaStream(pub *mut std::ffi::c_void);
 unsafe impl Send for CudaStream {}
 unsafe impl Sync for CudaStream {}
 
-impl CudaStream {
-    pub fn null() -> Self {
-        CudaStream(std::ptr::null_mut())
-    }
-
-    pub fn is_null(&self) -> bool {
-        self.0.is_null()
-    }
-
-    pub fn as_raw(&self) -> *mut std::ffi::c_void {
-        self.0
-    }
-}
-
-/// Create a CUDA stream
-pub fn gpu_stream_create() -> Result<CudaStream> {
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn() -> *mut std::ffi::c_void> =
-        unsafe { lib.get(b"gpu_stream_create")? };
-    let ptr = unsafe { func() };
-    if ptr.is_null() {
-        return Err(GpuError::KernelError(-1));
-    }
-    Ok(CudaStream(ptr))
-}
-
-/// Destroy a CUDA stream
-pub fn gpu_stream_destroy(stream: CudaStream) -> Result<()> {
-    if stream.is_null() {
-        return Ok(());
-    }
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-        unsafe { lib.get(b"gpu_stream_destroy")? };
-    unsafe { func(stream.0) };
-    Ok(())
-}
-
-/// Synchronize a CUDA stream (block until all work on stream completes)
-pub fn gpu_stream_synchronize(stream: CudaStream) -> Result<()> {
-    if stream.is_null() {
-        return Err(GpuError::KernelError(-1));
-    }
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void) -> i32> =
-        unsafe { lib.get(b"gpu_stream_synchronize")? };
-    let ret = unsafe { func(stream.0) };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
-    }
-    Ok(())
-}
-
-/// Async copy host -> device on given stream
-/// h_src should be page-locked for true async behavior
-pub fn gpu_copy_to_device_async(
-    dst: *mut std::ffi::c_void,
-    src: *const std::ffi::c_void,
-    bytes: usize,
-    stream: CudaStream,
-) -> Result<()> {
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void, usize, *mut std::ffi::c_void) -> i32> =
-        unsafe { lib.get(b"gpu_copy_to_device_async")? };
-    let ret = unsafe { func(dst, src, bytes, stream.0) };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
-    }
-    Ok(())
-}
-
-/// Async copy device -> host on given stream
-pub fn gpu_copy_to_host_async(
-    dst: *mut std::ffi::c_void,
-    src: *const std::ffi::c_void,
-    bytes: usize,
-    stream: CudaStream,
-) -> Result<()> {
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void, usize, *mut std::ffi::c_void) -> i32> =
-        unsafe { lib.get(b"gpu_copy_to_host_async")? };
-    let ret = unsafe { func(dst, src, bytes, stream.0) };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
-    }
-    Ok(())
-}
-
-/// Async batch KV copy for one position (all kv_heads)
-pub fn gpu_copy_kv_layer_async(
-    d_buf: *mut f32,
-    h_src: &[f32],
-    pos: usize,
-    n_kv_heads: usize,
-    max_seq_len: usize,
-    head_dim: usize,
-    stream: CudaStream,
-) -> Result<()> {
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*mut f32, *const f32, i32, i32, i32, i32, *mut std::ffi::c_void) -> i32> =
-        unsafe { lib.get(b"gpu_copy_kv_layer_async")? };
-    let ret = unsafe {
-        func(d_buf, h_src.as_ptr(), pos as i32, n_kv_heads as i32, max_seq_len as i32, head_dim as i32, stream.0)
-    };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
-    }
-    Ok(())
-}
-
-/// Stream-based attention: Q already on device
-pub fn gpu_attention_streamed(
-    d_q: *const f32,
-    d_k_cache: *const f32,
-    d_v_cache: *const f32,
-    d_out: *mut f32,
-    n_heads: usize,
-    n_kv_heads: usize,
-    seq_len: usize,
-    head_dim: usize,
-    kv_stride: usize,
-    stream: CudaStream,
-) -> Result<()> {
-    let lib = try_lib()?;
-    let func: Symbol<
-        unsafe extern "C" fn(*const f32, *const f32, *const f32, *mut f32, i32, i32, i32, i32, i32, *mut std::ffi::c_void) -> i32,
-    > = unsafe { lib.get(b"gpu_attention_streamed")? };
-    let ret = unsafe {
-        func(d_q, d_k_cache, d_v_cache, d_out,
-             n_heads as i32, n_kv_heads as i32, seq_len as i32, head_dim as i32, kv_stride as i32,
-             stream.0)
-    };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// FP16 KV cache support (half precision K/V for 2x memory bandwidth)
-// ---------------------------------------------------------------------------
-
-/// Stream-based attention with FP16 KV cache
-pub fn gpu_attention_streamed_half(
-    d_q: *const f32,
-    d_k_cache: *const std::ffi::c_void,  // half*
-    d_v_cache: *const std::ffi::c_void,  // half*
-    d_out: *mut f32,
-    n_heads: usize,
-    n_kv_heads: usize,
-    seq_len: usize,
-    head_dim: usize,
-    kv_stride: usize,
-    stream: CudaStream,
-) -> Result<()> {
-    let lib = try_lib()?;
-    let func: Symbol<
-        unsafe extern "C" fn(*const f32, *const std::ffi::c_void, *const std::ffi::c_void, *mut f32, i32, i32, i32, i32, i32, *mut std::ffi::c_void) -> i32,
-    > = unsafe { lib.get(b"gpu_attention_streamed_half")? };
-    let ret = unsafe {
-        func(d_q, d_k_cache, d_v_cache, d_out,
-             n_heads as i32, n_kv_heads as i32, seq_len as i32, head_dim as i32, kv_stride as i32,
-             stream.0)
-    };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
-    }
-    Ok(())
-}
-
-/// Async copy float host data → half GPU buffer for one layer position
-pub fn gpu_copy_kv_layer_async_half(
-    d_buf: *mut std::ffi::c_void,  // half*
-    h_src: &[f32],
-    pos: usize,
-    n_kv_heads: usize,
-    max_seq_len: usize,
-    head_dim: usize,
-    stream: CudaStream,
-) -> Result<()> {
-    let lib = try_lib()?;
-    let func: Symbol<
-        unsafe extern "C" fn(*mut std::ffi::c_void, *const f32, i32, i32, i32, i32, *mut std::ffi::c_void) -> i32,
-    > = unsafe { lib.get(b"gpu_copy_kv_layer_async_half")? };
-    let ret = unsafe {
-        func(d_buf, h_src.as_ptr(), pos as i32, n_kv_heads as i32, max_seq_len as i32, head_dim as i32, stream.0)
-    };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
-    }
-    Ok(())
-}
-
-/// Allocate persistent half-precision KV buffer
-pub fn gpu_alloc_kv_buffer_half(
-    n_kv_heads: usize,
-    max_seq_len: usize,
-    head_dim: usize,
-) -> Result<*mut std::ffi::c_void> {
-    let lib = try_lib()?;
-    let func: Symbol<
-        unsafe extern "C" fn(i32, i32, i32, *mut usize) -> *mut std::ffi::c_void,
-    > = unsafe { lib.get(b"gpu_alloc_kv_buffer_half")? };
-    let mut out_bytes: usize = 0;
-    let ptr = unsafe { func(n_kv_heads as i32, max_seq_len as i32, head_dim as i32, &mut out_bytes) };
-    if ptr.is_null() {
-        return Err(GpuError::KernelError(-1));
-    }
-    Ok(ptr)
-}
-
-/// Create a CUDA Graph executable for attention with FP16 KV cache
-pub fn gpu_graph_create_attention_half(
-    d_q: *const f32,
-    d_k_cache: *const std::ffi::c_void,  // half*
-    d_v_cache: *const std::ffi::c_void,  // half*
-    d_scores: *mut f32,
-    d_output: *mut f32,
-    n_heads: usize,
-    n_kv_heads: usize,
-    seq_len: usize,
-    head_dim: usize,
-    kv_stride: usize,
-) -> Result<AttentionGraph> {
-    let lib = try_lib()?;
-    let func: Symbol<
-        unsafe extern "C" fn(*const f32, *const std::ffi::c_void, *const std::ffi::c_void, *mut f32, *mut f32, i32, i32, i32, i32, i32) -> *mut std::ffi::c_void,
-    > = unsafe { lib.get(b"gpu_graph_create_attention_half")? };
-    let ptr = unsafe {
-        func(d_q, d_k_cache, d_v_cache, d_scores, d_output,
-             n_heads as i32, n_kv_heads as i32, seq_len as i32, head_dim as i32, kv_stride as i32)
-    };
-    if ptr.is_null() {
-        return Err(GpuError::KernelError(-1));
-    }
-    Ok(AttentionGraph(ptr))
-}
-
-// ---------------------------------------------------------------------------
-// CUDA Graph API: reusable attention compute graph
-// Eliminates kernel launch overhead for repeated attention calls
-// ---------------------------------------------------------------------------
-
-/// Opaque handle to a CUDA Graph executable for attention compute
-pub struct AttentionGraph(*mut std::ffi::c_void);
-
-unsafe impl Send for AttentionGraph {}
-unsafe impl Sync for AttentionGraph {}
-
-impl AttentionGraph {
-    pub fn is_null(&self) -> bool {
-        self.0.is_null()
-    }
-}
-
-/// Create a CUDA Graph executable for attention compute.
-/// All parameters (including seq_len) are FIXED at graph creation time.
-/// Caller should cache graphs by seq_len and create one per distinct value.
-pub fn gpu_graph_create_attention(
-    d_q: *const f32,
-    d_k_cache: *const f32,
-    d_v_cache: *const f32,
-    d_scores: *mut f32,
-    d_output: *mut f32,
-    n_heads: usize,
-    n_kv_heads: usize,
-    seq_len: usize,
-    head_dim: usize,
-    kv_stride: usize,
-) -> Result<AttentionGraph> {
-    let lib = try_lib()?;
-    let func: Symbol<
-        unsafe extern "C" fn(*const f32, *const f32, *const f32, *mut f32, *mut f32, i32, i32, i32, i32, i32) -> *mut std::ffi::c_void,
-    > = unsafe { lib.get(b"gpu_graph_create_attention")? };
-    let ptr = unsafe {
-        func(d_q, d_k_cache, d_v_cache, d_scores, d_output,
-             n_heads as i32, n_kv_heads as i32, seq_len as i32, head_dim as i32, kv_stride as i32)
-    };
-    if ptr.is_null() {
-        return Err(GpuError::KernelError(-1));
-    }
-    Ok(AttentionGraph(ptr))
-}
-
-/// Replay a fixed-parameter attention graph.
-/// All parameters must match the graph creation parameters exactly.
-pub fn gpu_graph_replay_attention(
-    graph: &AttentionGraph,
-    stream: CudaStream,
-) -> Result<()> {
-    if graph.is_null() {
-        return Err(GpuError::KernelError(-1));
-    }
-    let lib = try_lib()?;
-    let func: Symbol<
-        unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32,
-    > = unsafe { lib.get(b"gpu_graph_replay_attention")? };
-    let ret = unsafe { func(graph.0, stream.0) };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
-    }
-    Ok(())
-}
-
-/// Destroy an attention graph executable
-pub fn gpu_graph_destroy(graph: AttentionGraph) -> Result<()> {
-    if graph.is_null() {
-        return Ok(());
-    }
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-        unsafe { lib.get(b"gpu_graph_destroy")? };
-    unsafe { func(graph.0) };
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// CUDA Event API (for HLC timeline correlation)
-// ---------------------------------------------------------------------------
-
-/// Opaque handle to a CUDA event
 #[derive(Debug, Clone, Copy)]
-pub struct CudaEvent(*mut std::ffi::c_void);
-
+pub struct CudaEvent(pub *mut std::ffi::c_void);
 unsafe impl Send for CudaEvent {}
 unsafe impl Sync for CudaEvent {}
 
-impl CudaEvent {
-    /// Null/invalid event handle
-    pub fn null() -> Self {
-        CudaEvent(std::ptr::null_mut())
-    }
+#[derive(Debug, Clone, Copy)]
+pub struct AttentionGraph(pub *mut std::ffi::c_void);
+unsafe impl Send for AttentionGraph {}
+unsafe impl Sync for AttentionGraph {}
 
-    pub fn is_null(&self) -> bool {
-        self.0.is_null()
-    }
+#[derive(Debug, Clone, Copy)]
+pub struct LayerGraph(pub *mut std::ffi::c_void);
+unsafe impl Send for LayerGraph {}
+unsafe impl Sync for LayerGraph {}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GemvGraph(pub *mut std::ffi::c_void);
+unsafe impl Send for GemvGraph {}
+unsafe impl Sync for GemvGraph {}
+
+use thiserror::Error;
+
+#[derive(Error, Debug, Clone)]
+pub enum GpuError {
+    #[error("GPU not available (Vulkan fallback)")]
+    NotAvailable(String),
 }
 
-/// Create a CUDA event
-pub fn gpu_event_create() -> Result<CudaEvent> {
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn() -> *mut std::ffi::c_void> =
-        unsafe { lib.get(b"gpu_event_create")? };
-    let ptr = unsafe { func() };
-    if ptr.is_null() {
-        return Err(GpuError::KernelError(-1));
-    }
-    Ok(CudaEvent(ptr))
-}
+pub type GpuResult<T> = std::result::Result<T, GpuError>;
 
-/// Record a CUDA event on the given stream (null = default stream)
-pub fn gpu_event_record(event: CudaEvent, stream: *mut std::ffi::c_void) -> Result<()> {
-    if event.is_null() {
-        return Err(GpuError::KernelError(-1));
-    }
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32> =
-        unsafe { lib.get(b"gpu_event_record")? };
-    let ret = unsafe { func(event.0, stream) };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
-    }
-    Ok(())
-}
+pub fn gpu_init() -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_sync() -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_stream_create() -> GpuResult<CudaStream> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_stream_destroy(_: CudaStream) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_stream_synchronize(_: CudaStream) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_event_create() -> GpuResult<CudaEvent> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_event_destroy(_: CudaEvent) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_event_record(_: CudaEvent, _: *mut std::ffi::c_void) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_event_synchronize(_: CudaEvent) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_event_elapsed(_: CudaEvent, _: CudaEvent) -> GpuResult<f32> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
 
-/// Synchronize a CUDA event (block until recorded work completes)
-pub fn gpu_event_synchronize(event: CudaEvent) -> Result<()> {
-    if event.is_null() {
-        return Err(GpuError::KernelError(-1));
-    }
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void) -> i32> =
-        unsafe { lib.get(b"gpu_event_synchronize")? };
-    let ret = unsafe { func(event.0) };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
-    }
-    Ok(())
-}
+pub unsafe fn gpu_alloc(_: usize) -> GpuResult<*mut std::ffi::c_void> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_free(_: *mut std::ffi::c_void) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_alloc_kv_buffer_half(_: usize, _: usize, _: usize) -> GpuResult<*mut std::ffi::c_void> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_free_weights(_: *mut u8) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
 
-/// Elapsed time between two CUDA events in milliseconds
-pub fn gpu_event_elapsed_ms(start: CudaEvent, end: CudaEvent) -> Result<f32> {
-    if start.is_null() || end.is_null() {
-        return Err(GpuError::KernelError(-1));
-    }
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> f32> =
-        unsafe { lib.get(b"gpu_event_elapsed_ms")? };
-    let ms = unsafe { func(start.0, end.0) };
-    if ms < 0.0 {
-        return Err(GpuError::KernelError(-1));
-    }
-    Ok(ms)
-}
+pub fn gpu_upload_weights(_: *const u8, _: *mut *mut u8, _: usize, _: CudaStream) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_upload_weights_transposed(_: *const u8, _: *mut *mut u8, _: usize, _: i32, _: i32, _: CudaStream) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_gemv_q4k(_: *const u8, _: *const f32, _: *mut f32, _: i32, _: i32, _: CudaStream) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_gemv_q4k_full(_: *const u8, _: &[f32], _: &mut [f32], _: i32, _: i32, _: CudaStream) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_gemv_q4k_prealloc(_: *const u8, _: &[f32], _: &mut [f32], _: *mut f32, _: *mut f32, _: i32, _: i32, _: i32, _: i32, _: CudaStream) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_gemv_q6k(_: *const u8, _: *const f32, _: *mut f32, _: i32, _: i32, _: CudaStream) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
 
-/// Destroy a CUDA event
-pub fn gpu_event_destroy(event: CudaEvent) -> Result<()> {
-    if event.is_null() {
-        return Ok(());
-    }
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-        unsafe { lib.get(b"gpu_event_destroy")? };
-    unsafe { func(event.0) };
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_gpu_init() {
-        if !gpu_available() {
-            eprintln!("GPU not available, skipping test");
-            return;
-        }
-        assert!(gpu_init().is_ok());
-    }
-
-    #[test]
-    fn test_gpu_attention_small() {
-        if !gpu_available() {
-            eprintln!("GPU not available, skipping test");
-            return;
-        }
-        gpu_init().unwrap();
-
-        let n_heads = 2;
-        let n_kv_heads = 1;
-        let seq_len = 4;
-        let head_dim = 8;
-
-        let q = vec![1.0f32; n_heads * head_dim];
-        let mut k_cache = vec![0.0f32; n_kv_heads * seq_len * head_dim];
-        let mut v_cache = vec![0.0f32; n_kv_heads * seq_len * head_dim];
-
-        for t in 0..seq_len {
-            for d in 0..head_dim {
-                k_cache[t * head_dim + d] = t as f32 + d as f32 * 0.1;
-                v_cache[t * head_dim + d] = 1.0;
-            }
-        }
-
-        let mut output = vec![0.0f32; n_heads * head_dim];
-        let result = gpu_attention_forward(
-            &q, &k_cache, &v_cache, &mut output,
-            n_heads, n_kv_heads, seq_len, head_dim,
-        );
-        assert!(result.is_ok(), "attention failed: {:?}", result);
-
-        let sum: f32 = output.iter().sum();
-        assert!(sum > 0.0, "output sum should be positive, got {}", sum);
-        println!("GPU attention test passed. output[0..4]: {:?}", &output[..4.min(output.len())]);
-    }
-}
+pub fn gpu_alloc_buffers(_: *mut *mut f32, _: *mut *mut f32, _: i32, _: i32, _: CudaStream) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_free_buffers(_: *mut f32, _: *mut f32) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_copy_to_device_async(_: *mut std::ffi::c_void, _: *const std::ffi::c_void, _: usize, _: CudaStream) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_copy_to_host_async(_: *mut std::ffi::c_void, _: *const std::ffi::c_void, _: usize, _: CudaStream) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_copy_kv_layer_async_half(_: *mut std::ffi::c_void, _: &[f32], _: usize, _: usize, _: usize, _: usize, _: CudaStream) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_attention_streamed_half(_: *const f32, _: *const std::ffi::c_void, _: *const std::ffi::c_void, _: *mut f32, _: usize, _: usize, _: usize, _: usize, _: usize, _: CudaStream) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_graph_create_attention_half(_: *const f32, _: *const std::ffi::c_void, _: *const std::ffi::c_void, _: *mut f32, _: *mut f32, _: usize, _: usize, _: usize, _: usize, _: usize) -> GpuResult<AttentionGraph> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_graph_replay_attention(_: &AttentionGraph, _: CudaStream) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_graph_destroy(_: AttentionGraph) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_graph_create_gemv_q4k(_: *const u8, _: *const f32, _: *mut f32, _: i32, _: i32) -> GpuResult<GemvGraph> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_graph_create_gemv_q4k_qkv(_: *const u8, _: *const u8, _: *const u8, _: *const f32, _: *mut f32, _: *mut f32, _: *mut f32, _: i32, _: i32, _: i32, _: i32) -> GpuResult<GemvGraph> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_graph_create_gemv_q4k_gate_up(_: *const u8, _: *const u8, _: *const f32, _: *mut f32, _: *mut f32, _: i32, _: i32, _: i32) -> GpuResult<GemvGraph> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_graph_replay_gemv(_: &GemvGraph, _: CudaStream) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_graph_destroy_gemv(_: GemvGraph) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_attention_forward(_: &[f32], _: &[f32], _: &[f32], _: &mut [f32], _: usize, _: usize, _: usize, _: usize) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_event_elapsed_ms(_: CudaEvent, _: CudaEvent) -> GpuResult<f32> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_graph_create_layer(
+    _: *mut u8, _: *mut u8, _: *mut u8, _: *mut u8, _: *mut u8, _: *mut u8, _: *mut u8,
+    _: *mut f32, _: *mut f32,
+    _: *mut std::ffi::c_void, _: *mut std::ffi::c_void,
+    _: *mut f32, _: *mut f32, _: *mut f32, _: *mut f32, _: *mut f32,
+    _: *mut f32, _: *mut f32, _: *mut f32, _: *mut f32, _: *mut f32, _: *mut f32,
+    _: *mut i32, _: *mut i32,
+    _: usize, _: usize, _: usize, _: usize, _: usize, _: usize,
+    _: usize, _: usize, _: usize, _: usize, _: usize, _: usize, _: usize, _: usize,
+    _: f32,
+) -> GpuResult<LayerGraph> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_graph_replay_layer(_: &LayerGraph, _: CudaStream, _: usize, _: usize) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }
+pub fn gpu_graph_destroy_layer(_: LayerGraph) -> GpuResult<()> { Err(GpuError::NotAvailable("Vulkan backend".into())) }

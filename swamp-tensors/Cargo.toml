@@ -8,3 +8,5 @@ swamp-gguf = { path = "../swamp-gguf" }
 anyhow = { workspace = true }
 half = { workspace = true }
 libc = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
